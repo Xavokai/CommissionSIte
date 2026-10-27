@@ -149,12 +149,34 @@
     }
   }
 
-  // Gallery, rendered from site data. The first item is the large featured tile.
+  // Column spans (out of 12) chosen so no row of the gallery is left part-empty, whatever the item count.
+  // Wide screens: the first item is a two-row featured tile with two or four tiles beside it, and the rest fill
+  // rows of two to four. Counts with no such arrangement (1, 2, 4) skip the featured tile and use even rows.
+  // Tablet: rows of two, with the first item full width when the count is odd.
+  function gallerySpans(count) {
+    const evenRows = n => {
+      const rows = Math.ceil(n / 4);
+      return Array.from({ length: rows }, (_, i) => Math.floor(n / rows) + (i < n % rows ? 1 : 0))
+        .flatMap(length => Array(length).fill(12 / length));
+    };
+    const beside = count === 6 || count < 5 ? 2 : 4;
+    const featured = count >= 3 && count - 1 - beside !== 1;
+    return {
+      featured,
+      wide: featured ? [...(beside === 4 ? [6, 3, 3, 3, 3] : [8, 4, 4]), ...evenRows(count - 1 - beside)] : evenRows(count),
+      tablet: Array.from({ length: count }, (_, i) => (i === 0 && count % 2 ? 12 : 6)),
+    };
+  }
+
+  // Gallery, rendered from site data.
   const galleryGrid = document.getElementById('gallery-grid');
   if (galleryGrid) {
+    const spans = gallerySpans(galleryItems.length);
     galleryItems.forEach((item, index) => {
       const figure = document.createElement('figure');
-      figure.className = index === 0 ? 'gallery-item gallery-item-featured' : 'gallery-item';
+      figure.className = index === 0 && spans.featured ? 'gallery-item gallery-item-featured' : 'gallery-item';
+      figure.style.setProperty('--span', spans.wide[index]);
+      figure.style.setProperty('--span-md', spans.tablet[index]);
 
       const link = document.createElement('a');
       link.className = 'gallery-link';

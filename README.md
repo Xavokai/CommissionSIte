@@ -48,9 +48,9 @@ To add a picture by hand, export it as WebP (ideally 16:9, no wider than 1920px)
 
 How the gallery works:
 
-- The first entry is the large featured tile. On wide screens it takes up a 2×2 block on the left and the next four items sit beside it; on tablets it spans the full width; on phones everything stacks.
+- The first entry is the large featured tile. On wide screens it takes up a two-row block on the left with four items beside it (two when there are 3 or 6 items); on tablets it spans the full width when the item count is odd and is a normal tile otherwise; on phones everything stacks.
 - Thumbnails are cropped to 16:9 so the grid lines up. Images in other shapes still work, they're just cropped from the centre in the thumbnail.
-- Items after the fifth flow into new rows of four (two on tablets).
+- The remaining items fill rows of two to four (two on tablets), balanced so no picture ends up alone on a half-empty row. With 1, 2 or 4 items there is no featured block on wide screens, just one even row.
 - Clicking a picture opens it full size in an overlay (Escape, the Close button, or clicking outside it closes it). Ctrl/Cmd-click or middle-click opens it in a new tab.
 - If a gallery or slideshow image can't be loaded from the site itself, it is retried once straight from the GitHub repository (`https://raw.githubusercontent.com/Xavokai/CommissionSIte/main/<file>`), so it still shows once the image has been pushed.
 - `web.config` lets Visual Studio's built-in server (IIS Express) and IIS serve `.webp` images; without it they answer "404.3" and no gallery image appears. Other servers and GitHub Pages ignore it.
