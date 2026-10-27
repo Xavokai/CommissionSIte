@@ -1,0 +1,12 @@
+# Build outputs
+/build/
+/out/
+/.vs/
+/CommissionManager.exe
+*.obj
+*.o
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib

@@ -1,0 +1,53 @@
+#include <windows.h>
+#include "resource.h"
+
+1 24 "app.manifest"
+
+IDD_ADD DIALOGEX 0, 0, 320, 128
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Add image to gallery"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Image file:", -1, 10, 10, 300, 9
+    EDITTEXT        IDC_ADD_FILE, 10, 21, 240, 14, ES_AUTOHSCROLL | ES_READONLY
+    PUSHBUTTON      "Browse...", IDC_ADD_BROWSE, 256, 20, 54, 16
+    LTEXT           "&Display name (shown on the website):", -1, 10, 44, 300, 9
+    EDITTEXT        IDC_ADD_NAME, 10, 55, 300, 14, ES_AUTOHSCROLL
+    LTEXT           "", IDC_ADD_HINT, 10, 74, 300, 26
+    DEFPUSHBUTTON   "Add", IDOK, 200, 106, 52, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 258, 106, 52, 16
+END
+
+IDD_RENAME DIALOGEX 0, 0, 260, 72
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Rename gallery image"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "&New display name:", -1, 10, 10, 240, 9
+    EDITTEXT        IDC_RENAME_NAME, 10, 21, 240, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 140, 50, 52, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 198, 50, 52, 16
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "ZelRaccy Commission Manager"
+            VALUE "ProductName", "ZelRaccy Commission Manager"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "ProductVersion", "1.0.0.0"
+            VALUE "OriginalFilename", "CommissionManager.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
