@@ -49,6 +49,17 @@
     });
   }
 
+  // If a gallery image fails from its relative path, retry once straight from the GitHub repository.
+  const repoFiles = 'https://raw.githubusercontent.com/Xavokai/CommissionSIte/main/';
+  function useRepoFallback(img, file, link) {
+    img.addEventListener('error', () => {
+      if (img.dataset.fallbackApplied || /^([a-z][a-z0-9+.-]*:|\/\/)/i.test(file)) return;
+      img.dataset.fallbackApplied = 'true';
+      img.src = repoFiles + file.replace(/^\.?\/+/, '');
+      if (link) link.href = img.src;
+    });
+  }
+
   // Hero slideshow
   const showcase = document.getElementById('showcase');
   const slideshow = document.getElementById('slideshow');
@@ -71,6 +82,7 @@
       galleryItems.forEach((item, index) => {
         const img = document.createElement('img');
         img.className = 'slide';
+        useRepoFallback(img, item.file);
         img.src = item.file;
         img.alt = item.name;
         img.width = 1920;
@@ -151,6 +163,7 @@
       link.rel = 'noopener';
 
       const img = document.createElement('img');
+      useRepoFallback(img, item.file, link);
       img.src = item.file;
       img.alt = item.name;
       img.width = 1920;

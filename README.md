@@ -7,7 +7,7 @@ Live site: <https://xavokai.github.io/CommissionSIte/> (published from [Xavokai/
 ## Put it on GitHub Pages
 
 1. Download and extract the ZIP.
-2. Create a GitHub repository and upload the **contents** of this folder into the repository root. Keep `index.html`, `style.css`, `script.js`, `data/`, `assets/`, and `song.mp3` (if you use one) together.
+2. Create a GitHub repository and upload the **contents** of this folder into the repository root. Keep `index.html`, `style.css`, `script.js`, `web.config`, `data/`, `assets/`, and `song.mp3` (if you use one) together.
 3. In the repository, open **Settings → Pages**.
 4. Under **Build and deployment**, choose **Deploy from a branch**, select `main` and `/(root)`, then save.
 5. Open the URL GitHub Pages gives you after deployment.
@@ -18,12 +18,11 @@ A small Windows app for switching commissions open/closed, managing the gallery,
 
 - **Run it:** double-click `tools/CommissionManager/CommissionManager.exe`. Every change is saved to `data/site-data.js` immediately; nothing goes online until you click **Push changes**.
 - **Build it** (only needed if the exe is missing or the code changed): double-click `tools/CommissionManager/build.bat`. It needs Visual Studio (or Build Tools) with "Desktop development with C++", or MSYS2 MinGW-w64.
-- **First time publishing to [Xavokai/CommissionSIte](https://github.com/Xavokai/CommissionSIte):**
-  1. Check that **GitHub repository** shows `https://github.com/Xavokai/CommissionSIte.git` and click **Connect to GitHub…** → Yes. This turns the folder into a git repository on branch `main` linked to GitHub.
-  2. Click **Push changes**. Because the GitHub repository already has its own first commit (the LICENSE), GitHub refuses this first push and the app tells you to pull.
-  3. Click **Pull** and answer **Yes** to combine the two histories. GitHub's LICENSE is kept; where a file exists in both places, your local version wins.
-  4. Click **Push changes** again. Sign in to GitHub if a login window appears.
-- **After that:** **Push changes** publishes everything you changed in the folder (`index.html`, `song.mp3`, images, data — anything not in `.gitignore`), and the log lists the files being uploaded. If someone else changed the site on GitHub, click **Pull**, then push again.
+- **Publishing is three steps,** shown at the bottom of the window with a check mark on each finished step (a greyed-out button tells you why in its tooltip):
+  1. **Sign in to GitHub…** — your browser opens GitHub; sign in and click **Authorize**. The app then shows "Signed in as *your name*". (No browser sign-in available? Use **Use access token…** and follow the steps in that window.) You only do this once per computer.
+  2. **Connect folder…** — check that **GitHub repository** shows `https://github.com/Xavokai/CommissionSIte.git`, click it and answer **Yes**. Also once per computer.
+  3. **Push changes** — uploads everything you changed (`index.html`, `song.mp3`, images, data — anything not in `.gitignore`). The very first time, GitHub already has a LICENSE and the images you uploaded there, so the app asks once: **Combine and upload (keep my local site files)**.
+- **Sync from GitHub** downloads what's on GitHub (site data and gallery images); the app also does this by itself when it starts, if you're signed in. The **On GitHub** column in the gallery shows which images are already on GitHub. If the same file was changed both on GitHub and here, the app asks which version to keep.
 - **Turn on GitHub Pages once:** on GitHub open the repository's **Settings → Pages**, choose **Deploy from a branch**, branch `main`, folder `/(root)`, and save. A minute or two after each push the live site at <https://xavokai.github.io/CommissionSIte/> updates.
 
 ## Gallery, slideshow, and commission status: `data/site-data.js`
@@ -53,6 +52,8 @@ How the gallery works:
 - Thumbnails are cropped to 16:9 so the grid lines up. Images in other shapes still work, they're just cropped from the centre in the thumbnail.
 - Items after the fifth flow into new rows of four (two on tablets).
 - Clicking a picture opens it full size in an overlay (Escape, the Close button, or clicking outside it closes it). Ctrl/Cmd-click or middle-click opens it in a new tab.
+- If a gallery or slideshow image can't be loaded from the site itself, it is retried once straight from the GitHub repository (`https://raw.githubusercontent.com/Xavokai/CommissionSIte/main/<file>`), so it still shows once the image has been pushed.
+- `web.config` lets Visual Studio's built-in server (IIS Express) and IIS serve `.webp` images; without it they answer "404.3" and no gallery image appears. Other servers and GitHub Pages ignore it.
 
 How the hero slideshow works:
 

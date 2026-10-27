@@ -1,12 +1,16 @@
 // Console tests for the non-UI core. Never point these at the real website folder.
 //   core_tests json
+//   core_tests logic                            (pure helpers: error classification, credential parsing…)
 //   core_tests site <repo-copy> <image-dir>    (image-dir: big.png, alpha.png, photo.jpg)
 //   core_tests git  <sandbox-dir>               (creates its own repos + local bare "GitHub")
+//   core_tests cred                             (saves + removes a credential for a fake host)
+//   core_tests api                              (read-only, unauthenticated api.github.com checks)
 #include "../src/core.h"
 
 #include <objbase.h>
 #include <wincodec.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -101,6 +105,56 @@ static void TestSite(const std::wstring& repo, const std::wstring& images) {
 }
 
 // ---------------------------------------------------------------------------
+static void TestLogic() {
+    std::printf("[logic]\n");
+    CHECK(ClassifyGitOutput("fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com") ==
+          GitError::Offline);
+    CHECK(ClassifyGitOutput("fatal: unable to access 'https://github.com/x/y.git/': Failed to connect to github.com port 443") ==
+          GitError::Offline);
+    CHECK(ClassifyGitOutput("fatal: Cannot prompt because user interactivity has been disabled.\n"
+                            "fatal: could not read Username for 'https://github.com': terminal prompts disabled") ==
+          GitError::Auth);
+    CHECK(ClassifyGitOutput("remote: Invalid username or token.\nfatal: Authentication failed for 'https://github.com/x/y.git/'") ==
+          GitError::Auth);
+    CHECK(ClassifyGitOutput("remote: Permission to Xavokai/CommissionSIte.git denied to someone.\n"
+                            "fatal: unable to access '...': The requested URL returned error: 403") == GitError::NoAccess);
+    CHECK(ClassifyGitOutput("remote: Repository not found.\nfatal: repository 'https://github.com/x/y.git/' not found") ==
+          GitError::NotFound);
+    CHECK(ClassifyGitOutput("fatal: couldn't find remote ref refs/heads/main") == GitError::NoRemoteBranch);
+    CHECK(ClassifyGitOutput(" ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs") ==
+          GitError::NonFastForward);
+    CHECK(ClassifyGitOutput("Author identity unknown\n*** Please tell me who you are.") == GitError::Identity);
+    CHECK(ClassifyGitOutput("error: something else") == GitError::Other);
+
+    std::wstring u, p;
+    CHECK(ParseCredentialOutput("protocol=https\r\nhost=github.com\r\nusername=Xavokai\r\npassword=gho_abc=def\r\n", u, p));
+    CHECK(u == L"Xavokai" && p == L"gho_abc=def");
+    CHECK(!ParseCredentialOutput("fatal: Cannot prompt because user interactivity has been disabled.\n", u, p));
+    CHECK(ParseAccountList("Xavokai\nsecond-account\r\n\nwarning: something\n") ==
+          (std::vector<std::wstring>{L"Xavokai", L"second-account"}));
+    CHECK(ParseAccountList("").empty());
+    CHECK(CredentialRequest(L"github.com", L"me", L"tok\nhost=evil") ==
+          "protocol=https\nhost=github.com\nusername=me\npassword=tokhost=evil\n\n");
+    CHECK(CredentialRequest(L"github.com", L"", L"") == "protocol=https\nhost=github.com\n\n");
+    CHECK(CleanToken(L"  github_pat_11AB\r\n CD \"") == L"github_pat_11ABCD");
+    std::wstring login;
+    CHECK(ParseGitHubLogin(R"({"login":"Xavokai","id":229278996,"type":"User"})", login) && login == L"Xavokai");
+    CHECK(!ParseGitHubLogin(R"({"message":"Bad credentials"})", login));
+    CHECK(!ParseGitHubLogin("<html>", login));
+    std::wstring owner, name;
+    CHECK(GitHubRepoFromUrl(L"https://github.com/Xavokai/CommissionSIte.git", owner, name) && owner == L"Xavokai" &&
+          name == L"CommissionSIte");
+    CHECK(GitHubRepoFromUrl(L"https://Xavokai@github.com/Xavokai/CommissionSIte/", owner, name) && name == L"CommissionSIte");
+    CHECK(GitHubRepoFromUrl(L"git@github.com:Xavokai/CommissionSIte.git", owner, name) && owner == L"Xavokai");
+    CHECK(!GitHubRepoFromUrl(L"https://example.com/a/b.git", owner, name));
+    CHECK(!GitHubRepoFromUrl(L"https://github.com/Xavokai", owner, name));
+    PublishState s;
+    CHECK(!s.Unpublished());
+    s.ahead = 1;
+    CHECK(s.Unpublished());
+}
+
+// ---------------------------------------------------------------------------
 static int Sh(const std::wstring& dir, const std::wstring& cmd) {
     std::wstring full = L"cmd /c \"cd /d \"" + dir + L"\" && " + cmd + L" >nul 2>nul\"";
     return _wsystem(full.c_str());
@@ -113,19 +167,35 @@ static void WriteText(const std::wstring& path, const std::string& text) {
     CloseHandle(h);
 }
 
+static std::string ReadText(const std::wstring& path) {
+    std::string s;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return s;
+    char buf[4096];
+    DWORD n = 0;
+    while (ReadFile(h, buf, sizeof(buf), &n, nullptr) && n) s.append(buf, n);
+    CloseHandle(h);
+    return s;
+}
+
 static const char kFixture[] =
     "window.SITE_DATA = {\n  \"commissionsOpen\": true,\n  \"gallery\": [\n"
     "    { \"name\": \"Ember\", \"file\": \"assets/gallery/ember.webp\" }\n  ]\n};\n";
+static const char kLicense[] = "GNU GENERAL PUBLIC LICENSE (same text on both sides)\n";
+
+static void MakeDirs(const std::wstring& dir) {
+    for (const wchar_t* sub : {L"", L"\\data", L"\\assets", L"\\assets\\gallery"}) CreateDirectoryW((dir + sub).c_str(), nullptr);
+}
 
 static void MakeSite(const std::wstring& dir) {
-    CreateDirectoryW(dir.c_str(), nullptr);
-    CreateDirectoryW((dir + L"\\data").c_str(), nullptr);
-    CreateDirectoryW((dir + L"\\assets").c_str(), nullptr);
-    CreateDirectoryW((dir + L"\\assets\\gallery").c_str(), nullptr);
+    MakeDirs(dir);
     WriteText(dir + L"\\index.html", "<!doctype html><title>site</title>\n");
-    WriteText(dir + L"\\LICENSE", "local license text\n");
+    WriteText(dir + L"\\script.js", "console.log('site');\n");
+    WriteText(dir + L"\\README.md", "# site\n");
+    WriteText(dir + L"\\LICENSE", kLicense);
     WriteText(dir + L"\\data\\site-data.js", kFixture);
-    WriteText(dir + L"\\assets\\gallery\\ember.webp", "fake");
+    WriteText(dir + L"\\assets\\gallery\\ember.webp", "ember-local");
+    WriteText(dir + L"\\assets\\gallery\\nyxen.webp", "nyxen-same");
 }
 
 static const char* Name(GitOutcome o) {
@@ -135,125 +205,246 @@ static const char* Name(GitOutcome o) {
     case GitOutcome::NoGit: return "NoGit";
     case GitOutcome::NotRepo: return "NotRepo";
     case GitOutcome::NoRemote: return "NoRemote";
-    case GitOutcome::Rejected: return "Rejected";
+    case GitOutcome::NoSiteOnGitHub: return "NoSiteOnGitHub";
     case GitOutcome::Unrelated: return "Unrelated";
     case GitOutcome::Conflict: return "Conflict";
+    case GitOutcome::AuthFailed: return "AuthFailed";
+    case GitOutcome::NoAccess: return "NoAccess";
+    case GitOutcome::NotFound: return "NotFound";
+    case GitOutcome::Offline: return "Offline";
+    case GitOutcome::Cancelled: return "Cancelled";
     case GitOutcome::Failed: return "Failed";
     }
     return "?";
 }
 
-static GitOutcome Step(const char* what, GitResult r) {
+static GitResult Step(const char* what, GitResult r) {
     std::printf("  -> %s: %s  (%s)\n", what, Name(r.outcome), ToUtf8(r.message).c_str());
-    return r.outcome;
+    for (auto& f : r.files) std::printf("       file: %s\n", ToUtf8(f).c_str());
+    return r;
+}
+
+static bool Has(const std::vector<std::wstring>& v, const wchar_t* item) {
+    return std::find(v.begin(), v.end(), std::wstring(item)) != v.end();
+}
+
+static std::wstring Head(const std::wstring& dir) {
+    std::wstring tmp = dir + L"\\..\\head.txt";
+    _wsystem((L"cmd /c \"cd /d \"" + dir + L"\" && git rev-parse HEAD > \"" + tmp + L"\" 2>nul\"").c_str());
+    std::string s = ReadText(tmp);
+    DeleteFileW(tmp.c_str());
+    return FromUtf8(s);
 }
 
 static void TestGit(const std::wstring& sandbox) {
     std::printf("[git] %s\n", ToUtf8(sandbox).c_str());
-    const std::wstring bare = sandbox + L"\\github.git", seed = sandbox + L"\\seed", site = sandbox + L"\\site",
-                       other = sandbox + L"\\other";
-    const std::wstring url = bare;
     CreateDirectoryW(sandbox.c_str(), nullptr);
-
-    // "GitHub": a repository created online with only a LICENSE commit.
-    CHECK(Sh(sandbox, L"git init -q --bare -b main github.git") == 0);
-    CHECK(Sh(sandbox, L"git clone -q github.git seed") == 0);
-    WriteText(seed + L"\\LICENSE", "MIT License from GitHub\n");
-    CHECK(Sh(seed, L"git add LICENSE && git commit -qm \"Initial commit\" && git push -q origin main") == 0);
-
-    // The local website folder: not a git repository yet.
-    MakeSite(site);
-    RepoInfo info = InspectRepo(site);
-    CHECK(info.gitAvailable && !info.isRepo);
-    CHECK(Step("push before connect", PushChanges(site, L"x", Log)) == GitOutcome::NotRepo);
-    CHECK(Step("pull before connect", PullChanges(site, false, Log)) == GitOutcome::NotRepo);
-
-    CHECK(Step("connect", ConnectRepo(site, url, false, Log)) == GitOutcome::Done);
-    info = InspectRepo(site);
-    CHECK(info.isRepo && info.branch == L"main" && SameRemoteUrl(info.originUrl, url) && !info.hasCommits);
-
-    CHECK(Step("first push (GitHub has LICENSE)", PushChanges(site, L"first", Log)) == GitOutcome::Rejected);
-    CHECK(Step("pull without consent", PullChanges(site, false, Log)) == GitOutcome::Unrelated);
-    CHECK(Step("pull with consent", PullChanges(site, true, Log)) == GitOutcome::Done);
-    CHECK(Step("push after pull", PushChanges(site, L"first", Log)) == GitOutcome::Done);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git cat-file -e main:data/site-data.js") == 0);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git cat-file -e main:index.html") == 0);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git show main:LICENSE | findstr /c:\"local license\"") == 0);
-    CHECK(Step("push with nothing new", PushChanges(site, L"", Log)) == GitOutcome::NothingToDo);
-
-    // Normal edit → commit with summary → push.
-    SiteData d;
+    const std::wstring bare = sandbox + L"\\github.git", web = sandbox + L"\\web", site = sandbox + L"\\site",
+                       fresh = sandbox + L"\\fresh";
     std::wstring err;
-    CHECK(d.Load(site, err));
-    d.SetCommissionsOpen(false);
-    CHECK(d.Save(err));
-    CHECK(Step("push edit", PushChanges(site, L"commissions closed", Log)) == GitOutcome::Done);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git log -1 --format=%s main | findstr /c:\"Update site: commissions closed\"") == 0);
+    const std::wstring me = L"";
 
-    // Push publishes every change in the folder (index.html, new song.mp3, deletions) but honors
-    // .gitignore, e.g. the app's own build outputs.
-    WriteText(site + L"\\index.html", "<!doctype html><title>edited</title>\n");
+    // ---- The owner's real situation ----------------------------------------------------------------
+    // "GitHub": re-created on github.com with a LICENSE, then images uploaded in the browser (no site yet).
+    CHECK(Sh(sandbox, L"git init -q --bare -b main github.git") == 0);
+    CHECK(Sh(sandbox, L"git clone -q github.git web") == 0);
+    MakeDirs(web);
+    WriteText(web + L"\\LICENSE", kLicense);
+    CHECK(Sh(web, L"git add LICENSE && git commit -qm \"Initial commit\" && git push -q origin main") == 0);
+    WriteText(web + L"\\assets\\paw.svg", "<svg/>");
+    WriteText(web + L"\\assets\\gallery\\ember.webp", "ember-uploaded-on-github"); // differs from the local copy
+    WriteText(web + L"\\assets\\gallery\\nyxen.webp", "nyxen-same");               // identical
+    WriteText(web + L"\\assets\\gallery\\death.webp", "only-on-github");
+    CHECK(Sh(web, L"git add -A && git commit -qm \"Add files via upload\" && git push -q origin main") == 0);
+
+    // This folder: its own, older history (no shared commit), no upstream, a stale origin/main from the
+    // deleted repository, uncommitted edits and new untracked files that must be published.
+    MakeSite(site);
+    CHECK(Sh(site, L"git init -q -b main && git add LICENSE && git commit -qm \"Initial commit\"") == 0);
+    CHECK(Sh(site, L"git add -A && git commit -qm \"added tingy\" && git commit -q --allow-empty -m \"Initial site upload\"") == 0);
+    CHECK(Sh(site, L"git remote add origin \"" + bare + L"\" && git update-ref refs/remotes/origin/main HEAD~1") == 0);
+    WriteText(site + L"\\README.md", "# site (edited)\n");
+    WriteText(site + L"\\script.js", "console.log('edited');\n");
+    WriteText(site + L"\\web.config", "<configuration/>");
     WriteText(site + L"\\song.mp3", "fake mp3");
-    DeleteFileW((site + L"\\LICENSE").c_str());
-    CreateDirectoryW((site + L"\\tools").c_str(), nullptr);
-    CreateDirectoryW((site + L"\\tools\\CommissionManager").c_str(), nullptr);
-    CreateDirectoryW((site + L"\\tools\\CommissionManager\\build").c_str(), nullptr);
-    WriteText(site + L"\\tools\\CommissionManager\\.gitignore", "/build/\n/CommissionManager.exe\n");
-    WriteText(site + L"\\tools\\CommissionManager\\CommissionManager.exe", "exe");
-    WriteText(site + L"\\tools\\CommissionManager\\build\\main.obj", "obj");
-    WriteText(site + L"\\tools\\CommissionManager\\README.md", "tool readme\n");
-    CHECK(Step("push everything", PushChanges(site, L"edited page", Log)) == GitOutcome::Done);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git show main:index.html | findstr /c:\"edited\"") == 0);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git cat-file -e main:song.mp3") == 0);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git cat-file -e main:tools/CommissionManager/README.md") == 0);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git cat-file -e main:LICENSE") != 0);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git cat-file -e main:tools/CommissionManager/CommissionManager.exe") != 0);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git cat-file -e main:tools/CommissionManager/build/main.obj") != 0);
-    CHECK(Sh(sandbox, L"git --git-dir=github.git log -1 --format=%s main | findstr /c:\"Update site: edited page\"") == 0);
+    RepoInfo info = InspectRepo(site);
+    CHECK(info.isRepo && info.hasCommits && !info.hasUpstream && SameRemoteUrl(info.originUrl, bare));
+    const std::wstring head0 = Head(site);
 
-    // Someone else pushes; our push is rejected; pull (related history) then push works.
-    CHECK(Sh(sandbox, L"git clone -q github.git other") == 0);
-    WriteText(other + L"\\README.md", "readme\n");
-    CHECK(Sh(other, L"git add README.md && git commit -qm readme && git push -q origin main") == 0);
+    CHECK(Step("sync (GitHub has no site yet)", SyncFromGitHub(site, me, L"", MergeChoice::Ask, Log)).outcome ==
+          GitOutcome::NoSiteOnGitHub);
+    CHECK(Head(site) == head0 && ReadText(site + L"\\README.md") == "# site (edited)\n");
+    PublishState ps = GetPublishState(site);
+    CHECK(ps.remoteKnown && !ps.remoteHasSite && ps.localChanges && ps.Unpublished());
+    CHECK(Has(ps.remoteGallery, L"assets/gallery/ember.webp") && Has(ps.changedGallery, L"assets/gallery/ember.webp") &&
+          !Has(ps.changedGallery, L"assets/gallery/nyxen.webp"));
+
+    GitResult r = Step("push (needs the one confirmation)", PushChanges(site, me, L"first", MergeChoice::Ask, Log));
+    CHECK(r.outcome == GitOutcome::Unrelated && Has(r.files, L"assets/paw.svg") && Has(r.files, L"assets/gallery/death.webp"));
+    CHECK(!FileExists(site + L"\\.git\\MERGE_HEAD") && !FileExists(site + L"\\assets\\paw.svg"));
+    CHECK(Step("push (combine, keep local site)", PushChanges(site, me, L"first", MergeChoice::KeepLocal, Log)).outcome ==
+          GitOutcome::Done);
+    for (const wchar_t* f : {L"data/site-data.js", L"index.html", L"web.config", L"song.mp3", L"LICENSE", L"assets/paw.svg",
+                             L"assets/gallery/death.webp", L"assets/gallery/nyxen.webp"})
+        CHECK(Sh(sandbox, L"git --git-dir=github.git cat-file -e main:" + std::wstring(f)) == 0);
+    CHECK(Sh(sandbox, L"git --git-dir=github.git show main:assets/gallery/ember.webp | findstr /c:\"ember-local\"") == 0);
+    CHECK(Sh(sandbox, L"git --git-dir=github.git show main:README.md | findstr /c:\"edited\"") == 0);
+    CHECK(FileExists(site + L"\\assets\\paw.svg") && FileExists(site + L"\\assets\\gallery\\death.webp"));
+    CHECK(ReadText(site + L"\\assets\\gallery\\ember.webp") == "ember-local");
+    info = InspectRepo(site);
+    CHECK(info.hasUpstream);
+    ps = GetPublishState(site);
+    CHECK(ps.remoteHasSite && !ps.Unpublished() && ps.changedGallery.empty());
+    CHECK(Step("push again", PushChanges(site, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::NothingToDo);
+    CHECK(Step("sync when up to date", SyncFromGitHub(site, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::NothingToDo);
+
+    // ---- Another computer: empty folder → connect → sync downloads the site -----------------------
+    CreateDirectoryW(fresh.c_str(), nullptr);
+    CHECK(Step("connect fresh", ConnectRepo(fresh, bare, false, Log)).outcome == GitOutcome::Done);
+    CHECK(Step("sync fresh", SyncFromGitHub(fresh, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    SiteData d;
+    CHECK(d.Load(fresh, err) && d.Count() == 1 && d.CommissionsOpen());
+    CHECK(FileExists(fresh + L"\\assets\\gallery\\death.webp"));
+
+    // Edit there, push; the first folder fast-forwards on sync.
+    d.SetCommissionsOpen(false);
+    d.Add(L"Death", L"assets/gallery/death.webp");
+    CHECK(d.Save(err));
+    CHECK(Step("push from fresh", PushChanges(fresh, me, L"commissions closed", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(Sh(sandbox, L"git --git-dir=github.git log -1 --format=%s main | findstr /c:\"Update site: commissions closed\"") == 0);
+    CHECK(Step("sync site (fast-forward)", SyncFromGitHub(site, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(d.Load(site, err) && !d.CommissionsOpen() && d.Count() == 2);
+
+    // ---- Both sides changed different files: push combines automatically ------------------------
+    WriteText(fresh + L"\\index.html", "<!doctype html><title>from fresh</title>\n");
+    CHECK(Step("push index from fresh", PushChanges(fresh, me, L"page", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(d.Load(site, err));
     d.SetCommissionsOpen(true);
     CHECK(d.Save(err));
-    CHECK(Step("push while behind", PushChanges(site, L"commissions open", Log)) == GitOutcome::Rejected);
-    CHECK(Step("pull", PullChanges(site, false, Log)) == GitOutcome::Done);
-    CHECK(FileExists(site + L"\\README.md"));
-    CHECK(Step("push after pull", PushChanges(site, L"commissions open", Log)) == GitOutcome::Done);
+    CHECK(Step("push while behind", PushChanges(site, me, L"commissions open", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(ReadText(site + L"\\index.html").find("from fresh") != std::string::npos);
+    CHECK(Sh(sandbox, L"git --git-dir=github.git show main:data/site-data.js | findstr /c:\"\\\"commissionsOpen\\\": true\"") == 0);
 
-    // Conflicting edit to the same line: pull reports Conflict and leaves the repo clean.
-    CHECK(Sh(other, L"git pull -q origin main") == 0);
-    WriteText(other + L"\\data\\site-data.js", std::string(kFixture).replace(std::string(kFixture).find("Ember"), 5, "Other"));
-    CHECK(Sh(other, L"git commit -qam other && git push -q origin main") == 0);
+    // ---- Same line changed on both sides: ask, nothing changes; then each choice -----------------
+    CHECK(Step("sync fresh", SyncFromGitHub(fresh, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(d.Load(fresh, err));
+    d.Rename(0, L"Theirs");
+    CHECK(d.Save(err));
+    CHECK(Step("push rename from fresh", PushChanges(fresh, me, L"renamed", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
     CHECK(d.Load(site, err));
     d.Rename(0, L"Mine");
     CHECK(d.Save(err));
-    CHECK(Step("push conflicting", PushChanges(site, L"renamed", Log)) == GitOutcome::Rejected);
-    CHECK(Step("pull conflicting", PullChanges(site, false, Log)) == GitOutcome::Conflict);
-    CHECK(!DirExists(site + L"\\.git\\rebase-merge") && !DirExists(site + L"\\.git\\rebase-apply"));
-    CHECK(d.Load(site, err) && d.Item(0).name == L"Mine");
+    WriteText(site + L"\\assets\\gallery\\new.webp", "new local image");
+    const std::wstring head1 = Head(site);
+    r = Step("sync conflicting", SyncFromGitHub(site, me, L"renamed", MergeChoice::Ask, Log));
+    CHECK(r.outcome == GitOutcome::Conflict && Has(r.files, L"data/site-data.js"));
+    CHECK(!FileExists(site + L"\\.git\\MERGE_HEAD") && d.Load(site, err) && d.Item(0).name == L"Mine");
+    CHECK(Step("sync, use GitHub's", SyncFromGitHub(site, me, L"renamed", MergeChoice::UseGitHub, Log)).outcome ==
+          GitOutcome::Done);
+    CHECK(d.Load(site, err) && d.Item(0).name == L"Theirs");
+    CHECK(FileExists(site + L"\\assets\\gallery\\new.webp")); // non-conflicting local work survives
+    CHECK(Head(site) != head1);
+    CHECK(Step("push after choosing", PushChanges(site, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
 
-    // Changing origin requires consent.
-    CHECK(Step("connect other url (no consent)", ConnectRepo(site, L"https://example.com/x.git", false, Log)) == GitOutcome::Failed);
-    CHECK(Step("connect other url (consent)", ConnectRepo(site, L"https://example.com/x.git", true, Log)) == GitOutcome::Done);
-    CHECK(InspectRepo(site).originUrl == L"https://example.com/x.git");
+    CHECK(Step("sync fresh", SyncFromGitHub(fresh, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(d.Load(fresh, err));
+    d.Rename(0, L"Fresh name");
+    CHECK(d.Save(err));
+    CHECK(Step("push from fresh", PushChanges(fresh, me, L"renamed", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(d.Load(site, err));
+    d.Rename(0, L"Keep me");
+    CHECK(d.Save(err));
+    CHECK(Step("push conflicting", PushChanges(site, me, L"renamed", MergeChoice::Ask, Log)).outcome == GitOutcome::Conflict);
+    CHECK(Step("push, keep mine", PushChanges(site, me, L"renamed", MergeChoice::KeepLocal, Log)).outcome == GitOutcome::Done);
+    CHECK(Sh(sandbox, L"git --git-dir=github.git show main:data/site-data.js | findstr /c:\"Keep me\"") == 0);
 
-    // A repository without origin.
-    const std::wstring noRemote = sandbox + L"\\noremote";
-    MakeSite(noRemote);
-    CHECK(Sh(noRemote, L"git init -q") == 0);
-    CHECK(Step("push without origin", PushChanges(noRemote, L"", Log)) == GitOutcome::NoRemote);
+    // ---- A merge left half-done by another tool is cleaned up -------------------------------------
+    CHECK(Step("sync fresh", SyncFromGitHub(fresh, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(Sh(fresh, L"git checkout -q -b side") == 0);
+    WriteText(fresh + L"\\index.html", "side\n");
+    CHECK(Sh(fresh, L"git commit -qam side && git checkout -q main") == 0);
+    WriteText(fresh + L"\\index.html", "main\n");
+    CHECK(Sh(fresh, L"git commit -qam main-edit") == 0);
+    CHECK(Sh(fresh, L"git merge side") != 0);
+    CHECK(FileExists(fresh + L"\\.git\\MERGE_HEAD"));
+    CHECK(Step("sync with leftover merge", SyncFromGitHub(fresh, me, L"", MergeChoice::Ask, Log)).outcome ==
+          GitOutcome::NothingToDo);
+    CHECK(!FileExists(fresh + L"\\.git\\MERGE_HEAD") && d.Load(fresh, err) && d.Item(0).name == L"Keep me");
+    CHECK(ReadText(fresh + L"\\index.html").find("main") == 0);
+
+    // ---- Empty GitHub repository ----------------------------------------------------------------
+    const std::wstring empty = sandbox + L"\\empty", emptyBare = sandbox + L"\\empty.git";
+    CHECK(Sh(sandbox, L"git init -q --bare -b main empty.git") == 0);
+    MakeSite(empty);
+    CHECK(Step("connect", ConnectRepo(empty, emptyBare, false, Log)).outcome == GitOutcome::Done);
+    CHECK(Step("sync empty GitHub", SyncFromGitHub(empty, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::NoSiteOnGitHub);
+    CHECK(Step("push to empty GitHub", PushChanges(empty, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(Sh(sandbox, L"git --git-dir=empty.git log -1 --format=%s main | findstr /c:\"Initial site upload\"") == 0);
+
+    // ---- No git identity: commits use the GitHub login ------------------------------------------
+    CHECK(Sh(empty, L"git config user.useConfigOnly true && git config user.name \"\" && git config user.email \"\"") == 0);
+    WriteText(empty + L"\\index.html", "<!doctype html><title>identity</title>\n");
+    CHECK(Step("push without identity", PushChanges(empty, L"tester", L"page", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(Sh(sandbox, L"git --git-dir=empty.git log -1 --format=%ae main | findstr /c:\"tester@users.noreply.github.com\"") == 0);
+
+    // ---- Errors: not connected, no origin, offline, private/missing repo (never hangs) ----------
+    const std::wstring loose = sandbox + L"\\loose";
+    MakeSite(loose);
+    CHECK(Step("push before connect", PushChanges(loose, me, L"x", MergeChoice::Ask, Log)).outcome == GitOutcome::NotRepo);
+    CHECK(Sh(loose, L"git init -q") == 0);
+    CHECK(Step("sync without origin", SyncFromGitHub(loose, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::NoRemote);
+    CHECK(Step("connect offline url", ConnectRepo(loose, L"https://commission-manager-test.invalid/x.git", false, Log)).outcome ==
+          GitOutcome::Done);
+    CHECK(Step("sync offline", SyncFromGitHub(loose, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Offline);
+    CHECK(Step("change url (no consent)", ConnectRepo(loose, L"https://github.com/Xavokai/commission-manager-no-such-repo.git", false, Log))
+              .outcome == GitOutcome::Failed);
+    CHECK(Step("change url (consent)", ConnectRepo(loose, L"https://github.com/Xavokai/commission-manager-no-such-repo.git", true, Log))
+              .outcome == GitOutcome::Done);
+    const ULONGLONG t0 = GetTickCount64();
+    GitOutcome o = Step("sync private/missing GitHub repo", SyncFromGitHub(loose, me, L"", MergeChoice::Ask, Log)).outcome;
+    CHECK(o == GitOutcome::AuthFailed || o == GitOutcome::NotFound);
+    CHECK(GetTickCount64() - t0 < 60000);
+}
+
+// Saves and removes a credential for a host that can't exist, through the user's real credential helper.
+static void TestCred() {
+    std::printf("[cred]\n");
+    const std::wstring host = L"commission-manager-test.invalid";
+    std::wstring u, p;
+    CHECK(!ReadSavedCredential(host, L"tester", u, p));
+    CHECK(Step("save", SaveSignIn(host, L"tester", L"not-a-real-token-123", Log)).outcome == GitOutcome::Done);
+    CHECK(ReadSavedCredential(host, L"tester", u, p) && u == L"tester" && p == L"not-a-real-token-123");
+    CHECK(Step("sign out", SignOut(host, L"tester", Log)).outcome == GitOutcome::Done);
+    CHECK(!ReadSavedCredential(host, L"tester", u, p));
+    GitHubAccount a = CheckGitHubAccount(L"");
+    std::printf("  github.com account: git=%d gcm=%s signedIn=%d user=%s note=%s\n", a.gitAvailable,
+                ToUtf8(a.gcmVersion).c_str(), a.signedIn, ToUtf8(a.username).c_str(), ToUtf8(a.note).c_str());
+    CHECK(a.gitAvailable);
+}
+
+static void TestApi() {
+    std::printf("[api]\n");
+    HttpResponse repo = HttpGet(L"https://api.github.com/repos/Xavokai/CommissionSIte", L"");
+    CHECK(repo.status == 200 && repo.body.find("Xavokai/CommissionSIte") != std::string::npos);
+    HttpResponse user = HttpGet(L"https://api.github.com/user", L"");
+    CHECK(user.status == 401);
+    HttpResponse bad = HttpGet(L"https://api.github.com/user", L"github_pat_invalid_token_for_testing");
+    CHECK(bad.status == 401);
+    HttpResponse offline = HttpGet(L"https://commission-manager-test.invalid/", L"");
+    CHECK(offline.status == 0 && !offline.error.empty());
 }
 
 int wmain(int argc, wchar_t** argv) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     std::wstring mode = argc > 1 ? argv[1] : L"";
     if (mode == L"json") TestJson();
+    else if (mode == L"logic") TestLogic();
     else if (mode == L"site" && argc > 3) TestSite(argv[2], argv[3]);
     else if (mode == L"git" && argc > 2) TestGit(argv[2]);
+    else if (mode == L"cred") TestCred();
+    else if (mode == L"api") TestApi();
     else {
-        std::printf("usage: core_tests json | site <repo-copy> <image-dir> | git <sandbox-dir>\n");
+        std::printf("usage: core_tests json | logic | site <repo-copy> <image-dir> | git <sandbox-dir> | cred | api\n");
         return 2;
     }
     std::printf(g_failures ? "\n%d FAILURE(S)\n" : "\nALL PASSED\n", g_failures);

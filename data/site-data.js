@@ -6,6 +6,7 @@ window.SITE_DATA = {
     { "name": "ZelRaccy", "file": "assets/gallery/zelraccy.webp" },
     { "name": "Nyxen", "file": "assets/gallery/nyxen.webp" },
     { "name": "Lyserra", "file": "assets/gallery/lyserra.webp" },
-    { "name": "Death", "file": "assets/gallery/death.webp" }
+    { "name": "Death", "file": "assets/gallery/death.webp" },
+    { "name": "Bobtob", "file": "assets/gallery/bobtob.jpg" }
   ]
 };

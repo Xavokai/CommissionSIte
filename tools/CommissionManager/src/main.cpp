@@ -11,14 +11,17 @@
 #include <uxtheme.h>
 
 #include <algorithm>
+#include <memory>
 #include <thread>
 
 namespace {
 
 constexpr UINT WM_APP_INIT = WM_APP + 1;
 constexpr UINT WM_APP_LOG = WM_APP + 2;      // lParam: std::wstring*
-constexpr UINT WM_APP_GITDONE = WM_APP + 3; // lParam: GitTaskResult*
+constexpr UINT WM_APP_GITDONE = WM_APP + 3;  // lParam: GitTaskResult*
+constexpr UINT WM_APP_ACCOUNT = WM_APP + 4;  // lParam: GitHubAccount*
 constexpr UINT_PTR kThumbTimer = 1;
+constexpr UINT_PTR kDisabledTipOffset = 10000; // tooltip ids for the "why is this disabled" rectangles
 
 const wchar_t kAppName[] = L"ZelRaccy Commission Manager";
 const wchar_t kClassName[] = L"ZelRaccyCommissionManager";
@@ -44,11 +47,17 @@ enum : int {
     IDC_UP,
     IDC_DOWN,
     IDC_HEAD_PUBLISH,
+    IDC_STEPS,
+    IDC_ACCOUNT_LABEL,
+    IDC_ACCOUNT,
+    IDC_SIGNIN,
+    IDC_TOKEN,
+    IDC_SIGNOUT,
     IDC_REMOTE_LABEL,
     IDC_REMOTE,
     IDC_CONNECT,
     IDC_PUSH,
-    IDC_PULL,
+    IDC_SYNC,
     IDC_PUSH_RESULT,
     IDC_LOG,
     IDC_STATUSBAR,
@@ -58,18 +67,28 @@ struct AppState {
     HINSTANCE inst = nullptr;
     HWND hwnd = nullptr;
     UINT dpi = 96;
-    HFONT font = nullptr, fontHead = nullptr, fontBig = nullptr, fontMono = nullptr;
+    HFONT font = nullptr, fontHead = nullptr, fontBig = nullptr, fontMono = nullptr, fontBold = nullptr;
 
     HWND folderLabel{}, folder{}, browse{}, headStatus{}, toggle{}, toggleDesc{}, headGallery{}, list{}, add{},
-        rename{}, remove{}, up{}, down{}, headPublish{}, remoteLabel{}, remote{}, connect{}, push{}, pull{},
-        pushResult{}, log{}, status{};
+        rename{}, remove{}, up{}, down{}, headPublish{}, steps{}, accountLabel{}, accountText{}, signIn{}, token{},
+        signOut{}, remoteLabel{}, remote{}, connect{}, push{}, sync{}, pushResult{}, log{}, status{}, tips{};
 
     std::wstring repo;
     SiteData data;
     bool loaded = false;
-    bool busy = false; // a git task is running
+    bool busy = false;      // a git task is running
+    bool signingIn = false; // ...and it is the browser sign-in (which can be cancelled)
     std::vector<std::wstring> changes; // since last successful push → commit summary
     COLORREF pushResultColor = RGB(110, 110, 120);
+
+    // GitHub state
+    GitHubAccount account;
+    bool accountChecked = false, accountChecking = false;
+    bool startupSync = true; // sync once after the first sign-in check, if signed in and connected
+    RepoInfo repoInfo;
+    PublishState pub;
+    bool connected = false; // repository with origin == the address in the box
+    COLORREF accountColor = RGB(110, 110, 120);
 
     RECT previewRect{};
     HBITMAP thumb = nullptr;
@@ -192,9 +211,10 @@ HFONT MakeFont(int pt, int weight, const wchar_t* face) {
 }
 
 void CreateFonts() {
-    for (HFONT f : {g.font, g.fontHead, g.fontBig, g.fontMono})
+    for (HFONT f : {g.font, g.fontHead, g.fontBig, g.fontMono, g.fontBold})
         if (f) DeleteObject(f);
     g.font = MakeFont(10, FW_NORMAL, L"Segoe UI");
+    g.fontBold = MakeFont(10, FW_BOLD, L"Segoe UI");
     g.fontHead = MakeFont(12, FW_SEMIBOLD, L"Segoe UI");
     g.fontBig = MakeFont(15, FW_BOLD, L"Segoe UI");
     g.fontMono = MakeFont(9, FW_NORMAL, L"Consolas");
@@ -222,6 +242,41 @@ void ApplyFonts() {
 
 void Place(HDWP& dwp, HWND h, int x, int y, int w, int hgt) {
     dwp = DeferWindowPos(dwp, h, nullptr, x, y, std::max(w, 0), std::max(hgt, 0), SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Buttons that explain themselves in a tooltip, also while disabled.
+std::vector<HWND> TipControls() {
+    return {g.signIn, g.token, g.signOut, g.connect, g.push, g.sync, g.toggle, g.add, g.rename, g.remove, g.up, g.down};
+}
+
+// Disabled windows get no mouse messages, so each button also has a rectangle tool on the main window.
+void UpdateTipRects() {
+    for (HWND h : TipControls()) {
+        TOOLINFOW ti = {sizeof(ti)};
+        ti.hwnd = g.hwnd;
+        ti.uId = kDisabledTipOffset + GetDlgCtrlID(h);
+        GetWindowRect(h, &ti.rect);
+        MapWindowPoints(nullptr, g.hwnd, (POINT*)&ti.rect, 2);
+        SendMessageW(g.tips, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
+    }
+}
+
+void SetTip(HWND h, const std::wstring& text) {
+    TOOLINFOW ti = {sizeof(ti)};
+    ti.hwnd = g.hwnd;
+    ti.lpszText = const_cast<wchar_t*>(text.c_str());
+    ti.uFlags = TTF_IDISHWND;
+    ti.uId = (UINT_PTR)h;
+    SendMessageW(g.tips, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+    ti.uFlags = 0;
+    ti.uId = kDisabledTipOffset + GetDlgCtrlID(h);
+    SendMessageW(g.tips, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+}
+
+// Enables `h`; the tooltip says what it does, or why it can't be used yet.
+void Enable(HWND h, const std::wstring& whyNot, const std::wstring& tip) {
+    EnableWindow(h, whyNot.empty());
+    SetTip(h, whyNot.empty() ? tip : whyNot);
 }
 
 void Layout() {
@@ -252,11 +307,11 @@ void Layout() {
 
     // Remaining height is shared by the gallery and the publish log. The gallery keeps room for its
     // preview first; the log shrinks before it does, and extra height goes to the gallery.
-    const int pushH = S(34), remoteRowH = btnH + S(8), sectionGap = S(14);
-    const int avail = H - m - y - sectionGap - headGap - remoteRowH - pushH - S(10);
+    const int pushH = S(34), rowH = btnH + S(8), stepsH = S(30), sectionGap = S(14);
+    const int avail = H - m - y - sectionGap - headGap - stepsH - 2 * rowH - pushH - S(10);
     int logH = S(120), galH = avail - logH;
-    if (galH < S(300)) {
-        logH = std::max(S(64), avail - S(300));
+    if (galH < S(250)) {
+        logH = std::max(S(64), avail - S(250));
         galH = std::max(S(170), avail - logH);
     }
     const int colW = S(200), gap = S(12);
@@ -278,21 +333,35 @@ void Layout() {
 
     Place(dwp, g.headPublish, m, y, W - 2 * m, headH);
     y += headGap;
+    Place(dwp, g.steps, m, y, W - 2 * m, stepsH - S(4));
+    y += stepsH;
+    const int signOutW = S(92), tokenW = S(150), signInW = S(170);
+    int bx = W - m - signOutW;
+    Place(dwp, g.signOut, bx, y, signOutW, btnH);
+    bx -= S(8) + tokenW;
+    Place(dwp, g.token, bx, y, tokenW, btnH);
+    bx -= S(8) + signInW;
+    Place(dwp, g.signIn, bx, y, signInW, btnH);
+    Place(dwp, g.accountLabel, m, y + S(5), labelW, S(22));
+    Place(dwp, g.accountText, fieldX, y + S(5), bx - S(8) - fieldX, S(22));
+    y += rowH;
     Place(dwp, g.remoteLabel, m, y + S(5), labelW, S(22));
     Place(dwp, g.remote, fieldX, y + S(1), W - m - fieldX - S(190), S(28));
     Place(dwp, g.connect, W - m - S(182), y, S(182), btnH);
-    y += remoteRowH;
-    Place(dwp, g.push, m, y, S(180), pushH);
-    Place(dwp, g.pull, m + S(190), y, S(110), pushH);
-    Place(dwp, g.pushResult, m + S(314), y + S(6), W - 2 * m - S(314), S(24));
+    y += rowH;
+    Place(dwp, g.push, m, y, S(170), pushH);
+    Place(dwp, g.sync, m + S(180), y, S(170), pushH);
+    Place(dwp, g.pushResult, m + S(362), y + S(6), W - 2 * m - S(362), S(24));
     y += pushH + S(10);
     Place(dwp, g.log, m, y, W - 2 * m, logH);
     EndDeferWindowPos(dwp);
+    UpdateTipRects();
 
-    const int numW = S(56), nameW = std::max(S(120), (listW - numW - S(24)) * 2 / 5);
+    const int numW = S(56), githubW = S(130), nameW = std::max(S(120), (listW - numW - githubW - S(24)) * 2 / 5);
     ListView_SetColumnWidth(g.list, 0, numW);
     ListView_SetColumnWidth(g.list, 1, nameW);
-    ListView_SetColumnWidth(g.list, 2, std::max(S(120), listW - numW - nameW - S(24)));
+    ListView_SetColumnWidth(g.list, 2, std::max(S(120), listW - numW - nameW - githubW - S(24)));
+    ListView_SetColumnWidth(g.list, 3, githubW);
 
     if (!EqualRect(&oldPreview, &g.previewRect)) {
         InvalidateRect(g.hwnd, &oldPreview, TRUE);
@@ -317,23 +386,100 @@ void UpdatePreview() {
     InvalidateRect(g.hwnd, &g.previewRect, TRUE);
 }
 
+const wchar_t kNoGitHelp[] = L"Git isn't installed, so changes can't be published.\n\n"
+                             L"Install Git for Windows (git-scm.com) \u2014 it includes the GitHub sign-in helper \u2014 "
+                             L"then restart this app.";
+
+bool RemoteNeedsSignIn() { return _wcsnicmp(Trim(GetText(g.remote)).c_str(), L"https://", 8) == 0; }
+
+// The first reason that applies, or "" when the control can be used.
+std::wstring WhyNot(std::initializer_list<std::pair<bool, std::wstring>> checks) {
+    for (auto& c : checks)
+        if (c.first) return c.second;
+    return {};
+}
+
 void UpdateButtons() {
-    const bool editable = g.loaded && !g.busy;
     const int sel = SelectedIndex(), count = g.loaded ? (int)g.data.Count() : 0;
+    const std::wstring busy = L"Please wait until the current GitHub task has finished.";
+    const std::wstring noSite = L"Choose your website folder first (the one with data\\site-data.js).";
+    const std::wstring pick = L"Select an image in the list first.";
     EnableWindow(g.browse, !g.busy);
-    EnableWindow(g.toggle, editable);
     EnableWindow(g.list, g.loaded);
-    EnableWindow(g.add, editable);
-    EnableWindow(g.rename, editable && sel >= 0);
-    EnableWindow(g.remove, editable && sel >= 0);
-    EnableWindow(g.up, editable && sel > 0);
-    EnableWindow(g.down, editable && sel >= 0 && sel + 1 < count);
+    Enable(g.toggle, WhyNot({{g.busy, busy}, {!g.loaded, noSite}}), L"Switch the website between commissions OPEN and CLOSED.");
+    Enable(g.add, WhyNot({{g.busy, busy}, {!g.loaded, noSite}}), L"Copy an image into the gallery (Insert).");
+    Enable(g.rename, WhyNot({{g.busy, busy}, {!g.loaded, noSite}, {sel < 0, pick}}),
+           L"Change the name shown on the website (F2 or double-click).");
+    Enable(g.remove, WhyNot({{g.busy, busy}, {!g.loaded, noSite}, {sel < 0, pick}}),
+           L"Take the selected image out of the gallery (Delete).");
+    Enable(g.up, WhyNot({{g.busy, busy}, {!g.loaded, noSite}, {sel < 0, pick}, {sel == 0, L"This image is already first (featured)."}}),
+           L"Show this image earlier (Ctrl+Up). The first image is the featured one.");
+    Enable(g.down, WhyNot({{g.busy, busy}, {!g.loaded, noSite}, {sel < 0, pick}, {sel + 1 >= count, L"This image is already last."}}),
+           L"Show this image later (Ctrl+Down).");
     EnableWindow(g.remote, !g.busy);
-    EnableWindow(g.connect, editable);
-    EnableWindow(g.push, editable);
-    EnableWindow(g.pull, editable);
+
+    const bool git = g.repoInfo.gitAvailable;
+    const std::wstring noGit = L"Git isn't installed. Install Git for Windows (git-scm.com), then restart this app.";
+    const std::wstring checking = L"Checking whether you're signed in to GitHub\u2026";
+    const bool firstCheck = g.accountChecking && !g.accountChecked;
+    // Step 1: sign in
+    if (g.signingIn) {
+        SetWindowTextW(g.signIn, L"Cancel sign-in");
+        Enable(g.signIn, L"", L"Stop waiting for the sign-in in your web browser.");
+    } else {
+        SetWindowTextW(g.signIn, L"Sign in to GitHub\u2026"); // no mnemonic: a stray key must never start a sign-in
+        Enable(g.signIn,
+               WhyNot({{!git, noGit}, {g.busy, busy}, {firstCheck, checking},
+                       {g.account.signedIn, L"You're signed in as " + g.account.username +
+                                                L". To use a different account, click \u201cSign out\u201d first."}}),
+               g.accountChecked && g.account.gcmVersion.empty()
+                   ? L"Sign in by pasting a GitHub access token."
+                   : L"Opens GitHub in your web browser: sign in there and click \u201cAuthorize\u201d. The sign-in is "
+                     L"kept safely in Windows Credential Manager, and Push uses it automatically.");
+    }
+    Enable(g.token, WhyNot({{!git, noGit}, {g.busy, busy}, {g.account.signedIn, L"You're already signed in. Sign out first to use a token instead."}}),
+           L"Sign in by pasting a GitHub access token instead of using the browser.");
+    Enable(g.signOut, WhyNot({{g.busy, busy}, {!g.account.signedIn && g.account.username.empty(), L"You aren't signed in."}}),
+           L"Remove the saved GitHub sign-in from this computer.");
+    // Step 2: connect the folder
+    Enable(g.connect, WhyNot({{!git, noGit}, {g.busy, busy}, {!DirExists(g.repo), L"Choose your website folder first."}}),
+           g.connected ? L"This folder is connected to the repository address on the left."
+                       : L"Link this website folder to the GitHub repository (one time). Nothing is uploaded yet.");
+    // Step 3: publish
+    const bool needSignIn = RemoteNeedsSignIn() && !g.account.signedIn;
+    Enable(g.push,
+           WhyNot({{!git, noGit}, {g.busy, busy}, {!g.loaded, noSite}, {needSignIn && firstCheck, checking},
+                   {needSignIn, L"Sign in to GitHub first (step 1)."}, {!g.connected, L"Connect this folder to GitHub first (step 2)."}}),
+           L"Upload every change in this folder to GitHub (GitHub's newer changes are downloaded and combined first).");
+    Enable(g.sync, WhyNot({{!git, noGit}, {g.busy, busy}, {!g.connected, L"Connect this folder to GitHub first (step 2)."}}),
+           L"Download what's on GitHub (site data and gallery images) into this folder.");
     HWND focus = GetFocus();
     if (!focus || (focus != g.hwnd && !IsWindowEnabled(focus))) SetFocus(g.loaded ? g.list : g.browse);
+}
+
+void UpdateAccountText() {
+    std::wstring text;
+    COLORREF color = kMuted;
+    if (g.signingIn) {
+        text = L"Waiting for you to sign in in your web browser\u2026";
+        color = kAccent;
+    } else if (!g.accountChecked) {
+        text = L"Checking\u2026";
+    } else if (!g.account.gitAvailable) {
+        text = L"\u2716 Git isn't installed";
+        color = kClosed;
+    } else if (g.account.signedIn) {
+        text = L"\u2714 Signed in as " + g.account.username + (g.account.verified ? L"" : L" (" + g.account.note + L")");
+        color = kOpen;
+    } else {
+        text = L"\u2716 " + (g.account.note.empty() ? std::wstring(L"Not signed in \u2014 click \u201cSign in to GitHub\u201d")
+                                                    : g.account.note);
+        color = kClosed;
+    }
+    g.accountColor = color;
+    SetWindowTextW(g.accountText, text.c_str());
+    InvalidateRect(g.accountText, nullptr, TRUE);
+    InvalidateRect(g.steps, nullptr, TRUE);
 }
 
 void UpdateToggle() {
@@ -353,6 +499,26 @@ void UpdateToggle() {
     InvalidateRect(g.toggle, nullptr, TRUE);
 }
 
+// "On GitHub" column: compares the gallery file with the last download from GitHub.
+std::wstring GitHubColumn(const std::wstring& file) {
+    if (!g.connected) return L"";
+    if (!g.pub.remoteKnown) return L"\u2014";
+    auto has = [&](const std::vector<std::wstring>& v) {
+        return std::any_of(v.begin(), v.end(), [&](const std::wstring& f) { return _wcsicmp(f.c_str(), file.c_str()) == 0; });
+    };
+    if (!has(g.pub.remoteGallery)) return L"only on this PC";
+    if (has(g.pub.changedGallery)) return L"changed here";
+    return L"\u2714 on GitHub";
+}
+
+void RefreshGitHubColumn() {
+    if (!g.loaded) return;
+    for (size_t i = 0; i < g.data.Count() && (int)i < ListView_GetItemCount(g.list); ++i) {
+        std::wstring text = GitHubColumn(g.data.Item(i).file);
+        ListView_SetItemText(g.list, (int)i, 3, text.data());
+    }
+}
+
 void RefreshList(int select) {
     SendMessageW(g.list, WM_SETREDRAW, FALSE, 0);
     ListView_DeleteAllItems(g.list);
@@ -370,6 +536,7 @@ void RefreshList(int select) {
             if (!file.empty() && !FileExists(RepoPath(g.repo, file))) file += L"   (file missing!)";
             ListView_SetItemText(g.list, (int)i, 2, file.data());
         }
+        RefreshGitHubColumn();
     }
     SendMessageW(g.list, WM_SETREDRAW, TRUE, 0);
     Select(g.loaded ? std::min(select, (int)g.data.Count() - 1) : -1);
@@ -384,22 +551,37 @@ void RefreshAll(int select) {
     RefreshList(select);
 }
 
-// Shows whether the folder is connected to GitHub (runs a few quick git queries).
+// Re-reads the folder's git state (a few quick local git queries) and updates steps, buttons and the list.
 void UpdateGitState() {
-    if (!g.loaded || g.busy) return;
+    if (g.busy) return;
     HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    RepoInfo info = InspectRepo(g.repo);
+    g.repoInfo = InspectRepo(g.repo);
+    g.connected = g.repoInfo.isRepo && !g.repoInfo.originUrl.empty() && SameRemoteUrl(g.repoInfo.originUrl, GetText(g.remote));
+    g.pub = g.connected ? GetPublishState(g.repo) : PublishState();
     SetCursor(old);
-    if (!info.gitAvailable)
-        SetPushResult(L"Git isn't installed \u2014 install GitHub Desktop or Git for Windows to publish.", kClosed);
-    else if (!info.isRepo || info.originUrl.empty())
-        SetPushResult(L"Not connected to GitHub yet \u2014 click \u201cConnect to GitHub\u2026\u201d first.", kClosed);
-    else if (!SameRemoteUrl(info.originUrl, GetText(g.remote)))
-        SetPushResult(L"Connected to a different address: " + info.originUrl, kMuted);
+    RefreshGitHubColumn();
+    InvalidateRect(g.steps, nullptr, TRUE);
+    UpdateButtons();
+}
+
+// One line under the Push button saying what to do next.
+void ShowStateHint() {
+    const RepoInfo& i = g.repoInfo;
+    if (!i.gitAvailable)
+        SetPushResult(L"Git isn't installed \u2014 install Git for Windows (git-scm.com) to publish.", kClosed);
+    else if (!i.isRepo || i.originUrl.empty())
+        SetPushResult(L"Not connected to GitHub yet \u2014 click \u201cConnect folder\u2026\u201d (step 2).", kClosed);
+    else if (!g.connected)
+        SetPushResult(L"Linked to a different address (" + i.originUrl + L") \u2014 click \u201cConnect folder\u2026\u201d to change it.",
+                      kClosed);
+    else if (!g.pub.remoteKnown)
+        SetPushResult(L"Connected. Click \u201cSync from GitHub\u201d to see what's on GitHub.", kMuted);
+    else if (!g.pub.remoteHasSite)
+        SetPushResult(L"GitHub repo has no site files yet \u2014 click \u201cPush changes\u201d to upload this folder.", kAccent);
+    else if (g.pub.Unpublished())
+        SetPushResult(L"Some changes here aren't on GitHub yet \u2014 click \u201cPush changes\u201d to publish them.", kMuted);
     else
-        SetPushResult(L"Connected to GitHub (branch " + (info.branch.empty() ? std::wstring(L"?") : info.branch) +
-                          L"). Push uploads your saved changes.",
-                      kMuted);
+        SetPushResult(L"\u2714 GitHub has everything in this folder.", kOpen);
 }
 
 // Loads site data from `path`. Shows a message box on failure when `interactive`.
@@ -417,11 +599,15 @@ bool LoadRepo(const std::wstring& path, bool interactive) {
     } else {
         g.data = SiteData();
         SetStatus(L"Problem: " + err.substr(0, err.find(L'\n')) + L" Use Browse\u2026 to pick your website folder.");
-        SetPushResult(L"", kMuted);
     }
     RefreshAll(0);
     UpdateGitState();
-    if (!g.loaded && interactive) Message(err, MB_ICONERROR);
+    ShowStateHint();
+    if (!g.loaded && interactive)
+        Message(err + (DirExists(path) ? L"\n\nIf your website is already on GitHub, you can download it into this folder: "
+                                         L"connect the folder (step 2), then click \u201cSync from GitHub\u201d."
+                                       : L""),
+                MB_ICONERROR);
     return g.loaded;
 }
 
@@ -713,32 +899,45 @@ void OnMove(int delta) {
     Commit(L"reordered gallery", to);
 }
 
-enum class GitTask { Connect, Push, Pull };
+enum class GitTask { Connect, Push, Sync, SignIn, SaveToken, SignOut };
 
 struct GitTaskResult {
     GitTask task;
     GitResult result;
+    bool automatic; // started by the app itself (startup check): no pop-ups
 };
 
-const wchar_t kNoGitHelp[] = L"Git isn't installed, so changes can't be published.\n\n"
-                             L"Install GitHub Desktop (desktop.github.com) or Git for Windows (git-scm.com), "
-                             L"then restart this app.";
-
 // Runs `work` on a worker thread; output streams into the log, the result arrives as WM_APP_GITDONE.
-void RunGitTask(GitTask task, const std::wstring& title, std::function<GitResult(const LogFn&)> work) {
+void RunGitTask(GitTask task, const std::wstring& title, std::function<GitResult(const LogFn&)> work,
+                bool automatic = false) {
     g.busy = true;
     UpdateButtons();
+    UpdateAccountText();
     SetPushResult(title + L"\u2026 please wait.", kMuted);
     SetStatus(title + L"\u2026");
     AppendLog(L"=== " + title + L" (" + NowText() + L") ===");
     HWND hwnd = g.hwnd;
-    std::thread([task, work = std::move(work), hwnd] {
+    std::thread([task, work = std::move(work), hwnd, automatic] {
         LogFn log = [hwnd](const std::wstring& line) {
             auto* p = new std::wstring(line);
             if (!PostMessageW(hwnd, WM_APP_LOG, 0, (LPARAM)p)) delete p;
         };
-        auto* r = new GitTaskResult{task, work(log)};
+        auto* r = new GitTaskResult{task, work(log), automatic};
         if (!PostMessageW(hwnd, WM_APP_GITDONE, 0, (LPARAM)r)) delete r;
+    }).detach();
+}
+
+// Checks the saved GitHub sign-in in the background; the result arrives as WM_APP_ACCOUNT.
+void StartAccountCheck() {
+    if (g.accountChecking) return;
+    g.accountChecking = true;
+    UpdateAccountText();
+    UpdateButtons();
+    const std::wstring preferred = LoadSetting(L"GitHubUser", L"");
+    HWND hwnd = g.hwnd;
+    std::thread([preferred, hwnd] {
+        auto* a = new GitHubAccount(CheckGitHubAccount(preferred));
+        if (!PostMessageW(hwnd, WM_APP_ACCOUNT, 0, (LPARAM)a)) delete a;
     }).detach();
 }
 
@@ -748,8 +947,22 @@ std::wstring RemoteUrlText() {
     return url;
 }
 
-void OnConnect() {
+void OnSync(MergeChoice choice, bool automatic) {
+    if (g.busy || !DirExists(g.repo)) return;
+    const std::wstring repo = g.repo, summary = CommitSummary(), user = g.account.signedIn ? g.account.username : L"";
+    RunGitTask(GitTask::Sync, automatic ? L"Checking GitHub for changes" : L"Syncing from GitHub",
+               [=](const LogFn& log) { return SyncFromGitHub(repo, user, summary, choice, log); }, automatic);
+}
+
+void OnPush(MergeChoice choice) {
     if (!g.loaded || g.busy) return;
+    const std::wstring repo = g.repo, summary = CommitSummary(), user = g.account.signedIn ? g.account.username : L"";
+    RunGitTask(GitTask::Push, L"Publishing to GitHub",
+               [=](const LogFn& log) { return PushChanges(repo, user, summary, choice, log); });
+}
+
+void OnConnect() {
+    if (g.busy || !DirExists(g.repo)) return;
     const std::wstring url = RemoteUrlText();
     if (url.empty()) {
         Message(L"Please enter the GitHub repository address, for example:\n" + std::wstring(kDefaultRemoteUrl),
@@ -782,10 +995,10 @@ void OnConnect() {
         steps += L"\u2022 Change its GitHub address to " + url + L"\n";
     }
     if (steps.empty()) {
-        Message(L"This folder is already connected to\n" + url +
-                    L"\n(branch main). Use \u201cPush changes\u201d to publish.",
-                MB_ICONINFORMATION);
         UpdateGitState();
+        Message(L"This folder is already connected to\n" + url +
+                    L"\n(branch main). Use \u201cSync from GitHub\u201d to download and \u201cPush changes\u201d to publish.",
+                MB_ICONINFORMATION);
         return;
     }
     if (Message(L"Connect this website folder to GitHub?\n\n" + g.repo + L"\n\nThis will:\n" + steps +
@@ -798,81 +1011,317 @@ void OnConnect() {
     });
 }
 
-void OnPush() {
-    if (!g.loaded || g.busy) return;
-    const std::wstring repo = g.repo, summary = CommitSummary();
-    RunGitTask(GitTask::Push, L"Publishing to GitHub",
-               [repo, summary](const LogFn& log) { return PushChanges(repo, summary, log); });
+// ---- Sign-in ----------------------------------------------------------------------------------
+struct TokenDialogData {
+    std::wstring owner, name; // repository the token must be allowed to change
+    std::wstring token, login;
+};
+
+INT_PTR CALLBACK TokenDlgProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* d = reinterpret_cast<TokenDialogData*>(GetWindowLongPtrW(dlg, DWLP_USER));
+    switch (msg) {
+    case WM_INITDIALOG: {
+        d = reinterpret_cast<TokenDialogData*>(lp);
+        SetWindowLongPtrW(dlg, DWLP_USER, lp);
+        const std::wstring info =
+            L"A token lets this app upload to GitHub for you. To make one:\r\n"
+            L"1.  Click \u201cCreate a token on GitHub\u201d (sign in there if asked).\r\n"
+            L"2.  Token name: e.g. \u201cCommission Manager\u201d. Expiration: your choice (e.g. 1 year).\r\n"
+            L"3.  Repository access: \u201cOnly select repositories\u201d \u2192 " + d->name + L".\r\n"
+            L"4.  Permissions \u2192 Repository permissions \u2192 Contents \u2192 \u201cRead and write\u201d.\r\n"
+            L"5.  Click \u201cGenerate token\u201d, copy it, and paste it below.";
+        SetDlgItemTextW(dlg, IDC_TOKEN_INFO, info.c_str());
+        SetDlgItemTextW(dlg, IDC_TOKEN_OPEN, L"Create a token on GitHub\u2026");
+        SetDlgItemTextW(dlg, IDC_TOKEN_STATUS, L"The token is checked with GitHub, then kept in Windows Credential Manager.");
+        SetFocus(GetDlgItem(dlg, IDC_TOKEN_EDIT));
+        return FALSE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_TOKEN_OPEN:
+            ShellExecuteW(dlg, L"open", kNewTokenUrl, nullptr, nullptr, SW_SHOWNORMAL);
+            return TRUE;
+        case IDC_TOKEN_SHOW: {
+            const bool show = IsDlgButtonChecked(dlg, IDC_TOKEN_SHOW) == BST_CHECKED;
+            SendDlgItemMessageW(dlg, IDC_TOKEN_EDIT, EM_SETPASSWORDCHAR, show ? 0 : 0x25CF, 0);
+            InvalidateRect(GetDlgItem(dlg, IDC_TOKEN_EDIT), nullptr, TRUE);
+            return TRUE;
+        }
+        case IDOK: {
+            std::wstring pasted = GetText(GetDlgItem(dlg, IDC_TOKEN_EDIT));
+            std::wstring token = CleanToken(pasted);
+            SecureZeroMemory(pasted.data(), pasted.size() * sizeof(wchar_t));
+            if (token.empty()) {
+                SetDlgItemTextW(dlg, IDC_TOKEN_STATUS, L"Paste the token into the box first.");
+                SetFocus(GetDlgItem(dlg, IDC_TOKEN_EDIT));
+                return TRUE;
+            }
+            SetDlgItemTextW(dlg, IDC_TOKEN_STATUS, L"Checking the token with GitHub\u2026");
+            UpdateWindow(dlg);
+            HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+            HttpResponse r = HttpGet(L"https://api.github.com/user", token);
+            SetCursor(old);
+            std::wstring login;
+            if (r.status == 200 && ParseGitHubLogin(r.body, login)) {
+                d->token = token;
+                d->login = login;
+                SecureZeroMemory(token.data(), token.size() * sizeof(wchar_t));
+                EndDialog(dlg, IDOK);
+                return TRUE;
+            }
+            SecureZeroMemory(token.data(), token.size() * sizeof(wchar_t));
+            std::wstring problem =
+                r.status == 401 ? L"GitHub didn't accept this token. Make sure you copied all of it (it starts with "
+                                  L"\u201cgithub_pat_\u201d) and that it hasn't expired."
+                : r.status == 0 ? L"Couldn't reach GitHub \u2014 check your internet connection. (" + r.error + L")"
+                                : L"GitHub answered with an error (HTTP " + std::to_wstring(r.status) + L"). Try again in a minute.";
+            SetDlgItemTextW(dlg, IDC_TOKEN_STATUS, problem.c_str());
+            MessageBeep(MB_ICONWARNING);
+            return TRUE;
+        }
+        case IDCANCEL: EndDialog(dlg, IDCANCEL); return TRUE;
+        }
+        break;
+    }
+    return FALSE;
 }
 
-void OnPull(bool allowUnrelated) {
-    if (!g.loaded || g.busy) return;
-    const std::wstring repo = g.repo;
-    RunGitTask(GitTask::Pull, L"Pulling from GitHub",
-               [repo, allowUnrelated](const LogFn& log) { return PullChanges(repo, allowUnrelated, log); });
+void OnToken() {
+    if (g.busy) return;
+    TokenDialogData d;
+    if (!GitHubRepoFromUrl(GetText(g.remote), d.owner, d.name)) GitHubRepoFromUrl(kDefaultRemoteUrl, d.owner, d.name);
+    if (DialogBoxParamW(g.inst, MAKEINTRESOURCEW(IDD_TOKEN), g.hwnd, TokenDlgProc, (LPARAM)&d) != IDOK) return;
+    const std::wstring login = d.login;
+    auto token = std::make_shared<std::wstring>(std::move(d.token));
+    RunGitTask(GitTask::SaveToken, L"Saving your GitHub sign-in", [login, token](const LogFn& log) {
+        GitResult r = SaveSignIn(kGitHubHost, login, *token, log);
+        SecureZeroMemory(token->data(), token->size() * sizeof(wchar_t));
+        return r;
+    });
+}
+
+void OnSignIn() {
+    if (g.signingIn) {
+        AppendLog(L"Cancelling the sign-in\u2026");
+        CancelSignIn();
+        return;
+    }
+    if (g.busy) return;
+    if (g.accountChecked && g.account.gcmVersion.empty()) {
+        // No Git Credential Manager (browser sign-in): use an access token instead.
+        OnToken();
+        return;
+    }
+    // Always confirm (Cancel is the default), so the browser sign-in only starts on purpose.
+    if (Message(L"Sign in to GitHub?\n\nYour web browser will open GitHub. Sign in there (if asked) and click "
+                L"\u201cAuthorize\u201d, then come back here. The sign-in is kept safely in Windows Credential Manager.",
+                MB_ICONQUESTION | MB_OKCANCEL | MB_DEFBUTTON2) != IDOK)
+        return;
+    g.signingIn = true;
+    RunGitTask(GitTask::SignIn, L"Signing in to GitHub", [](const LogFn& log) { return SignInWithBrowser(log); });
+    SetPushResult(L"Your web browser opens GitHub: sign in there and click \u201cAuthorize\u201d.", kAccent);
+}
+
+void OnSignOut() {
+    if (g.busy) return;
+    const std::wstring user = g.account.username;
+    if (Message(L"Sign out of GitHub" + (user.empty() ? std::wstring() : L" (" + user + L")") +
+                    L" on this computer?\n\nThe saved sign-in is removed from Windows Credential Manager. You'll need "
+                    L"to sign in again before you can push changes.",
+                MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+        return;
+    RunGitTask(GitTask::SignOut, L"Signing out of GitHub",
+               [user](const LogFn& log) { return SignOut(kGitHubHost, user, log); });
+}
+
+void OnAccountChecked(GitHubAccount* a) {
+    const bool first = !g.accountChecked;
+    g.account = *a;
+    delete a;
+    g.accountChecking = false;
+    g.accountChecked = true;
+    if (g.account.signedIn && !g.account.username.empty()) SaveSetting(L"GitHubUser", g.account.username);
+    if (first)
+        AppendLog(g.account.gcmVersion.empty() ? L"Git Credential Manager not found: sign in with an access token."
+                                               : L"Git Credential Manager " + g.account.gcmVersion.substr(0, g.account.gcmVersion.find(L'+')) +
+                                                     L" found (browser sign-in available).");
+    AppendLog(g.account.signedIn ? L"GitHub: signed in as " + g.account.username
+                                 : L"GitHub: not signed in" + (g.account.note.empty() ? L"" : L" \u2014 " + g.account.note));
+    UpdateAccountText();
+    UpdateButtons();
+    if (g.startupSync) {
+        g.startupSync = false;
+        if (g.account.signedIn && g.connected && !g.busy) OnSync(MergeChoice::Ask, true);
+    }
+}
+
+// Asks how to combine when GitHub and this folder both changed. False = cancelled.
+bool AskMergeChoice(GitTask task, const GitResult& res, MergeChoice& choice) {
+    std::wstring list;
+    for (size_t i = 0; i < res.files.size(); ++i) {
+        if (i == 8) {
+            list += L"\n   \u2026 and " + std::to_wstring(res.files.size() - 8) + L" more";
+            break;
+        }
+        list += L"\n   \u2022 " + res.files[i];
+    }
+    std::wstring instruction, content;
+    std::vector<TASKDIALOG_BUTTON> buttons;
+    if (res.outcome == GitOutcome::Unrelated && task == GitTask::Push) {
+        instruction = L"Combine with GitHub and upload?";
+        content = res.message + L"\n\nFiles that are only on GitHub are kept (and copied into this folder). Where a file "
+                                L"exists in both places, this computer's version is kept. Then everything in this "
+                                L"folder is uploaded." +
+                  (list.empty() ? L"" : L"\n\nOnly on GitHub:" + list);
+        buttons.push_back({1001, L"Combine and upload\nKeep my local site files"});
+    } else if (res.outcome == GitOutcome::Unrelated) {
+        instruction = L"GitHub has a different copy of the website";
+        content = res.message + L"\n\nFiles that are only on GitHub are copied here either way. Which version should "
+                                L"be kept where a file exists in both places?" +
+                  (list.empty() ? L"" : L"\n\nOnly on GitHub:" + list);
+        buttons.push_back({1001, L"Keep this computer's files\nGitHub's extra files are added; nothing here is replaced"});
+        buttons.push_back({1002, L"Use GitHub's files\nFiles that differ are replaced with the copies from GitHub"});
+    } else {
+        instruction = L"Some files were changed both on GitHub and on this computer";
+        content = L"Choose which version to keep for these files. All other changes from both sides are kept." + list;
+        buttons.push_back({1001, L"Keep this computer's version\nYour edits here win for these files"});
+        buttons.push_back({1002, L"Use GitHub's version\nYour edits to these files are replaced by GitHub's"});
+    }
+    TASKDIALOGCONFIG tc = {};
+    tc.cbSize = sizeof(tc);
+    tc.hwndParent = g.hwnd;
+    tc.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    tc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    tc.pszWindowTitle = kAppName;
+    tc.pszMainIcon = TD_INFORMATION_ICON;
+    tc.pszMainInstruction = instruction.c_str();
+    tc.pszContent = content.c_str();
+    tc.cButtons = (UINT)buttons.size();
+    tc.pButtons = buttons.data();
+    tc.nDefaultButton = 1001;
+    int button = 0;
+    if (FAILED(TaskDialogIndirect(&tc, &button, nullptr, nullptr))) return false;
+    if (button == 1001) choice = MergeChoice::KeepLocal;
+    else if (button == 1002) choice = MergeChoice::UseGitHub;
+    else return false;
+    return true;
 }
 
 void OnGitDone(GitTaskResult* r) {
     const GitTask task = r->task;
     const GitResult res = r->result;
+    const bool automatic = r->automatic;
     delete r;
     g.busy = false;
-    UpdateButtons();
-    AppendLog(res.message);
+    g.signingIn = false;
+    if (!res.message.empty()) AppendLog(res.message);
     AppendLog(L"");
-    const wchar_t* what = task == GitTask::Connect ? L"Connect" : task == GitTask::Push ? L"Push" : L"Pull";
 
+    if (task == GitTask::SignIn || task == GitTask::SaveToken || task == GitTask::SignOut) {
+        if (res.outcome == GitOutcome::Done) {
+            SaveSetting(L"GitHubUser", task == GitTask::SignOut ? std::wstring() : res.account);
+            SetPushResult(L"\u2714 " + res.message, kOpen);
+            g.startupSync = task != GitTask::SignOut; // download from GitHub once the sign-in is confirmed
+        } else if (res.outcome == GitOutcome::Cancelled) {
+            SetPushResult(res.message, kMuted);
+        } else {
+            SetPushResult(L"\u2716 " + res.message, kClosed);
+            Message(res.message, MB_ICONWARNING);
+        }
+        g.accountChecked = false;
+        UpdateGitState();
+        StartAccountCheck();
+        return;
+    }
+
+    const std::wstring what = task == GitTask::Connect ? L"Connect" : task == GitTask::Push ? L"Push" : L"Sync";
     switch (res.outcome) {
     case GitOutcome::Done:
-        if (task == GitTask::Pull) LoadRepo(g.repo, true); // GitHub may have changed the site data
-        if (task == GitTask::Push) g.changes.clear();
+        if (task == GitTask::Connect) {
+            UpdateGitState();
+            SetPushResult(L"\u2714 " + res.message, kOpen);
+            SetStatus(L"Connected at " + NowText() + L".");
+            OnSync(MergeChoice::Ask, false); // show what's on GitHub right away
+            return;
+        }
+        g.changes.clear(); // committed (and, for Push, uploaded)
+        LoadRepo(g.repo, !automatic); // GitHub may have changed the site data and images
         SetPushResult(L"\u2714 " + res.message, kOpen);
-        SetStatus(std::wstring(what) + L" finished at " + NowText() + L".");
+        SetStatus(what + L" finished at " + NowText() + L".");
         break;
     case GitOutcome::NothingToDo:
         if (task == GitTask::Push) g.changes.clear();
+        UpdateGitState();
         SetPushResult(L"\u2714 " + res.message, kOpen);
         SetStatus(res.message);
         break;
+    case GitOutcome::NoSiteOnGitHub:
+        UpdateGitState();
+        SetPushResult(res.message, kAccent);
+        SetStatus(res.message);
+        break;
     case GitOutcome::NoGit:
+        UpdateGitState();
         SetPushResult(L"\u2716 Git isn't installed.", kClosed);
-        Message(kNoGitHelp, MB_ICONINFORMATION);
+        if (!automatic) Message(kNoGitHelp, MB_ICONINFORMATION);
         break;
     case GitOutcome::NotRepo:
     case GitOutcome::NoRemote:
-        SetPushResult(L"\u2716 Not connected to GitHub yet \u2014 click \u201cConnect to GitHub\u2026\u201d.", kClosed);
-        SetStatus(res.message);
-        if (Message(res.message + L"\n\nYour changes are saved on this computer. Connect this folder to\n" +
-                        RemoteUrlText() + L"\nnow?",
-                    MB_ICONQUESTION | MB_YESNO) == IDYES)
-            OnConnect();
-        break;
-    case GitOutcome::Rejected:
-        SetPushResult(L"\u2716 GitHub has newer changes \u2014 click \u201cPull\u201d, then \u201cPush changes\u201d again.",
-                      kClosed);
-        SetStatus(L"Push refused: pull first.");
-        Message(res.message, MB_ICONWARNING);
-        SetFocus(g.pull);
+        UpdateGitState();
+        SetPushResult(L"\u2716 Not connected to GitHub yet \u2014 click \u201cConnect folder\u2026\u201d (step 2).", kClosed);
+        if (!automatic) Message(res.message + L"\n\nClick \u201cConnect folder\u2026\u201d (step 2) first.", MB_ICONINFORMATION);
         break;
     case GitOutcome::Unrelated:
-        SetPushResult(L"Pull needs your confirmation.", kMuted);
-        if (Message(L"This folder and the GitHub repository have separate histories \u2014 for example, the "
-                    L"repository was created on github.com with its own files (like a LICENSE or README).\n\n"
-                    L"Combine them? Files that exist only on GitHub are added to this folder; where the same file "
-                    L"exists in both places, the version in this folder is kept.\n\n"
-                    L"Nothing is uploaded until you click \u201cPush changes\u201d.",
-                    MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) == IDYES)
-            OnPull(true);
-        else
-            SetPushResult(L"Pull cancelled \u2014 nothing was changed.", kMuted);
-        break;
-    case GitOutcome::Conflict:
-    case GitOutcome::Failed:
-        SetPushResult(L"\u2716 " + std::wstring(what) + L" failed \u2014 see the details below.", kClosed);
-        SetStatus(std::wstring(what) + L" failed.");
-        Message(res.message, MB_ICONERROR);
+    case GitOutcome::Conflict: {
+        UpdateGitState();
+        if (automatic) {
+            SetPushResult(L"GitHub and this folder both have changes \u2014 click \u201cSync from GitHub\u201d to choose what to keep.",
+                          kAccent);
+            break;
+        }
+        MergeChoice choice;
+        if (!AskMergeChoice(task, res, choice)) {
+            SetPushResult(L"Cancelled \u2014 nothing was changed.", kMuted);
+            break;
+        }
+        if (task == GitTask::Push) OnPush(choice);
+        else OnSync(choice, false);
         break;
     }
+    case GitOutcome::AuthFailed:
+        UpdateGitState();
+        SetPushResult(L"\u2716 GitHub didn't accept the sign-in \u2014 click \u201cSign in to GitHub\u201d (step 1).", kClosed);
+        if (!automatic) Message(res.message, MB_ICONWARNING);
+        g.accountChecked = false;
+        StartAccountCheck();
+        break;
+    case GitOutcome::NoAccess:
+        UpdateGitState();
+        SetPushResult(L"\u2716 This GitHub account isn't allowed to change the repository.", kClosed);
+        if (!automatic) Message(res.message, MB_ICONWARNING);
+        break;
+    case GitOutcome::NotFound:
+        UpdateGitState();
+        SetPushResult(L"\u2716 GitHub couldn't find the repository \u2014 check the address (step 2).", kClosed);
+        if (!automatic) Message(res.message, MB_ICONWARNING);
+        break;
+    case GitOutcome::Offline:
+        UpdateGitState();
+        SetPushResult(L"\u2716 Can't reach GitHub \u2014 check your internet connection.", kClosed);
+        if (!automatic) Message(res.message, MB_ICONWARNING);
+        break;
+    case GitOutcome::Cancelled:
+        UpdateGitState();
+        SetPushResult(res.message, kMuted);
+        break;
+    case GitOutcome::Failed:
+        UpdateGitState();
+        SetPushResult(L"\u2716 " + what + L" didn't work \u2014 see the details below.", kClosed);
+        SetStatus(what + L" failed.");
+        if (!automatic) Message(res.message, MB_ICONERROR);
+        break;
+    }
+    UpdateAccountText();
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1371,61 @@ void DrawToggle(const DRAWITEMSTRUCT* di) {
         SetTextColor(dc, RGB(0, 0, 0));
         SetBkColor(dc, RGB(255, 255, 255));
         DrawFocusRect(dc, &fr);
+    }
+}
+
+// "1 Sign in → 2 Connect folder → 3 Push changes" with a check mark on each finished step.
+void DrawSteps(const DRAWITEMSTRUCT* di) {
+    HDC dc = di->hDC;
+    RECT rc = di->rcItem;
+    FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+    const bool signedIn = g.account.signedIn;
+    const bool published = g.connected && g.pub.remoteKnown && g.pub.remoteHasSite && !g.pub.Unpublished();
+    struct Step {
+        std::wstring label;
+        bool done;
+    } steps[] = {
+        {signedIn ? L"Signed in as " + g.account.username : std::wstring(L"Sign in to GitHub"), signedIn},
+        {g.connected ? std::wstring(L"Folder connected") : std::wstring(L"Connect folder"), g.connected},
+        {published ? std::wstring(L"Published \u2014 GitHub is up to date") : std::wstring(L"Push changes"), published},
+    };
+    int current = 3;
+    for (int i = 2; i >= 0; --i)
+        if (!steps[i].done) current = i;
+
+    SetBkMode(dc, TRANSPARENT);
+    const int d = S(22), cy = (rc.top + rc.bottom) / 2;
+    int x = rc.left;
+    for (int i = 0; i < 3; ++i) {
+        const COLORREF fill = steps[i].done ? kOpen : i == current ? kAccent : RGB(176, 176, 184);
+        HBRUSH br = CreateSolidBrush(fill);
+        HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, x, cy - d / 2, x + d + 1, cy + d / 2 + 1);
+        SelectObject(dc, ob);
+        SelectObject(dc, op);
+        DeleteObject(br);
+        HGDIOBJ of = SelectObject(dc, g.fontBold);
+        SetTextColor(dc, RGB(255, 255, 255));
+        std::wstring mark = steps[i].done ? L"\u2714" : std::to_wstring(i + 1);
+        RECT cr = {x, cy - d / 2, x + d, cy + d / 2};
+        DrawTextW(dc, mark.c_str(), -1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        x += d + S(6);
+
+        SelectObject(dc, i == current ? g.fontBold : g.font);
+        SetTextColor(dc, steps[i].done ? kOpen : i == current ? kAccent : kMuted);
+        SIZE ts{};
+        GetTextExtentPoint32W(dc, steps[i].label.c_str(), (int)steps[i].label.size(), &ts);
+        RECT tr = {x, rc.top, std::min<LONG>(x + ts.cx, rc.right), rc.bottom};
+        DrawTextW(dc, steps[i].label.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        x += ts.cx + S(12);
+        if (i < 2) {
+            SelectObject(dc, g.font);
+            SetTextColor(dc, kMuted);
+            RECT ar = {x, rc.top, x + S(24), rc.bottom};
+            DrawTextW(dc, L"\u2192", -1, &ar, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            x += S(24) + S(4);
+        }
+        SelectObject(dc, of);
     }
 }
 
@@ -978,8 +1482,8 @@ void CreateControls() {
                  IDC_LIST, WS_EX_CLIENTEDGE);
     ListView_SetExtendedListViewStyle(g.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
     SetWindowTheme(g.list, L"Explorer", nullptr);
-    const wchar_t* cols[] = {L"#", L"Name", L"Image file"};
-    for (int i = 0; i < 3; ++i) {
+    const wchar_t* cols[] = {L"#", L"Name", L"Image file", L"On GitHub"};
+    for (int i = 0; i < 4; ++i) {
         LVCOLUMNW c = {};
         c.mask = LVCF_TEXT | LVCF_WIDTH;
         c.pszText = const_cast<wchar_t*>(cols[i]);
@@ -992,19 +1496,41 @@ void CreateControls() {
     g.up = Ctl(L"BUTTON", L"Move &up", WS_TABSTOP | BS_PUSHBUTTON, IDC_UP);
     g.down = Ctl(L"BUTTON", L"Move &down", WS_TABSTOP | BS_PUSHBUTTON, IDC_DOWN);
 
-    g.headPublish = Ctl(L"STATIC", L"Publish to the website", SS_LEFT, IDC_HEAD_PUBLISH);
+    g.headPublish = Ctl(L"STATIC", L"Publish to the website (GitHub)", SS_LEFT, IDC_HEAD_PUBLISH);
+    g.steps = Ctl(L"STATIC", L"", SS_OWNERDRAW, IDC_STEPS);
+    g.accountLabel = Ctl(L"STATIC", L"GitHub account:", SS_LEFT, IDC_ACCOUNT_LABEL);
+    g.accountText = Ctl(L"STATIC", L"Checking\u2026", SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX, IDC_ACCOUNT);
+    g.signIn = Ctl(L"BUTTON", L"Sign in to GitHub\u2026", WS_TABSTOP | BS_PUSHBUTTON, IDC_SIGNIN);
+    g.token = Ctl(L"BUTTON", L"Use access &token\u2026", WS_TABSTOP | BS_PUSHBUTTON, IDC_TOKEN);
+    g.signOut = Ctl(L"BUTTON", L"Sign &out", WS_TABSTOP | BS_PUSHBUTTON, IDC_SIGNOUT);
     g.remoteLabel = Ctl(L"STATIC", L"GitHub repository:", SS_LEFT, IDC_REMOTE_LABEL);
     g.remote = Ctl(L"EDIT", LoadSetting(L"RemoteUrl", kDefaultRemoteUrl).c_str(), WS_TABSTOP | ES_AUTOHSCROLL,
                    IDC_REMOTE, WS_EX_CLIENTEDGE);
-    g.connect = Ctl(L"BUTTON", L"&Connect to GitHub\u2026", WS_TABSTOP | BS_PUSHBUTTON, IDC_CONNECT);
+    g.connect = Ctl(L"BUTTON", L"&Connect folder\u2026", WS_TABSTOP | BS_PUSHBUTTON, IDC_CONNECT);
     g.push = Ctl(L"BUTTON", L"&Push changes", WS_TABSTOP | BS_PUSHBUTTON, IDC_PUSH);
-    g.pull = Ctl(L"BUTTON", L"P&ull", WS_TABSTOP | BS_PUSHBUTTON, IDC_PULL);
+    g.sync = Ctl(L"BUTTON", L"S&ync from GitHub", WS_TABSTOP | BS_PUSHBUTTON, IDC_SYNC);
     g.pushResult = Ctl(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX, IDC_PUSH_RESULT);
     g.log = Ctl(L"EDIT", L"", WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG,
                 WS_EX_CLIENTEDGE);
     SendMessageW(g.log, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
     g.status = CreateWindowExW(0, STATUSCLASSNAMEW, L"", WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, g.hwnd,
                                (HMENU)(INT_PTR)IDC_STATUSBAR, g.inst, nullptr);
+
+    g.tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT,
+                             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, g.hwnd, nullptr, g.inst, nullptr);
+    SendMessageW(g.tips, TTM_SETMAXTIPWIDTH, 0, S(380));
+    SendMessageW(g.tips, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+    for (HWND h : TipControls()) {
+        TOOLINFOW ti = {sizeof(ti)};
+        ti.hwnd = g.hwnd;
+        ti.lpszText = const_cast<wchar_t*>(L"");
+        ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS; // while enabled: the button itself
+        ti.uId = (UINT_PTR)h;
+        SendMessageW(g.tips, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+        ti.uFlags = TTF_SUBCLASS; // while disabled: its rectangle on the main window (rect set in Layout)
+        ti.uId = kDisabledTipOffset + GetDlgCtrlID(h);
+        SendMessageW(g.tips, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1020,6 +1546,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_APP_INIT:
         LoadRepo(g.repo, true);
+        StartAccountCheck(); // then syncs from GitHub if signed in and connected
         return 0;
 
     case WM_SIZE:
@@ -1035,7 +1562,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_GETMINMAXINFO: {
         auto* mmi = reinterpret_cast<MINMAXINFO*>(lp);
-        mmi->ptMinTrackSize = {S(700), S(640)};
+        mmi->ptMinTrackSize = {S(760), S(700)};
         return 0;
     }
 
@@ -1057,6 +1584,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkColor(dc, GetSysColor(COLOR_WINDOW));
         if (ctl == g.headStatus || ctl == g.headGallery || ctl == g.headPublish) SetTextColor(dc, kAccent);
         else if (ctl == g.pushResult) SetTextColor(dc, g.pushResultColor);
+        else if (ctl == g.accountText) SetTextColor(dc, g.accountColor);
         else SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
         return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
@@ -1065,6 +1593,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* di = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
         if (di->CtlID == IDC_TOGGLE) {
             DrawToggle(di);
+            return TRUE;
+        }
+        if (di->CtlID == IDC_STEPS) {
+            DrawSteps(di);
             return TRUE;
         }
         break;
@@ -1087,9 +1619,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_REMOVE: OnRemove(); return 0;
         case IDC_UP: OnMove(-1); return 0;
         case IDC_DOWN: OnMove(+1); return 0;
+        case IDC_SIGNIN: OnSignIn(); return 0;
+        case IDC_TOKEN: OnToken(); return 0;
+        case IDC_SIGNOUT: OnSignOut(); return 0;
         case IDC_CONNECT: OnConnect(); return 0;
-        case IDC_PUSH: OnPush(); return 0;
-        case IDC_PULL: OnPull(false); return 0;
+        case IDC_PUSH: OnPush(MergeChoice::Ask); return 0;
+        case IDC_SYNC: OnSync(MergeChoice::Ask, false); return 0;
         case IDC_REMOTE:
             if (HIWORD(wp) == EN_KILLFOCUS) {
                 RemoteUrlText();
@@ -1133,9 +1668,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         OnGitDone(reinterpret_cast<GitTaskResult*>(lp));
         return 0;
 
+    case WM_APP_ACCOUNT:
+        OnAccountChecked(reinterpret_cast<GitHubAccount*>(lp));
+        return 0;
+
     case WM_CLOSE:
         if (g.busy && Message(L"Git is still working. Quit anyway?", MB_ICONWARNING | MB_YESNO) != IDYES)
             return 0;
+        if (g.signingIn) CancelSignIn();
         DestroyWindow(hwnd);
         return 0;
 
@@ -1184,7 +1724,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     MONITORINFO mi = {sizeof(mi)};
     GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
     const RECT& wa = mi.rcWork;
-    int w = std::min(S(940), (int)(wa.right - wa.left)), h = std::min(S(800), (int)(wa.bottom - wa.top));
+    int w = std::min(S(980), (int)(wa.right - wa.left)), h = std::min(S(880), (int)(wa.bottom - wa.top));
     SetWindowPos(hwnd, nullptr, wa.left + (wa.right - wa.left - w) / 2, wa.top + (wa.bottom - wa.top - h) / 2, w, h,
                  SWP_NOZORDER | SWP_NOACTIVATE);
     ShowWindow(hwnd, show);

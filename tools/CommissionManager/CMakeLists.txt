@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 option(COMMISSION_MANAGER_TESTS "Build the core_tests console program" ON)
 
-set(WIN_LIBS comctl32 comdlg32 shell32 ole32 oleaut32 uuid windowscodecs uxtheme msimg32 gdi32 user32 advapi32)
+set(WIN_LIBS comctl32 comdlg32 shell32 ole32 oleaut32 uuid windowscodecs uxtheme msimg32 gdi32 user32 advapi32 winhttp)
 
 function(apply_common target)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE)
