@@ -1,4 +1,5 @@
 window.SITE_DATA = {
+  "version": "20261027T231744Z",
   "commissionsOpen": true,
   "gallery": [
     { "name": "Ember", "file": "assets/gallery/ember.webp" },

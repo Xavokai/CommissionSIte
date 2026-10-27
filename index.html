@@ -15,8 +15,9 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
-  <script src="data/site-data.js"></script>
-  <script src="script.js" defer></script>
+  <!-- script.js loads data/site-data.js itself. ?v=1 only makes sure the first visit after this update gets the new
+       script.js; after that sw.js keeps it fresh, so the number never needs changing. -->
+  <script src="script.js?v=1" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>

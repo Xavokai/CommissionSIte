@@ -73,18 +73,23 @@ struct GalleryItem {
     std::wstring file;
 };
 
+// Every save stamps a top-level "version" (UTC time, see NewVersionStamp) as the first key, so the website
+// can tell a fresh copy of data/site-data.js from a cached one.
 class SiteData {
 public:
     // Loads <repo>\data\site-data.js. On failure returns false with a user-readable message.
     bool Load(const std::wstring& repo, std::wstring& error);
-    // Atomically rewrites data/site-data.js (temp file + replace).
-    bool Save(std::wstring& error) const;
+    // Sets "version" (`version`, or NewVersionStamp() if empty) and atomically rewrites data/site-data.js
+    // (temp file + replace).
+    bool Save(std::wstring& error, const std::wstring& version = L"");
 
     const std::wstring& Repo() const { return repo_; }
     const std::wstring& DataPath() const { return dataPath_; }
 
     bool CommissionsOpen() const;
     void SetCommissionsOpen(bool open);
+    std::wstring Version() const; // "" if none
+    void SetVersion(const std::wstring& version); // always placed first
 
     size_t Count() const;
     GalleryItem Item(size_t i) const;
@@ -106,6 +111,17 @@ private:
     std::string suffix_; // text after the final ';', preserved
     json::Value root_;
 };
+
+// "20261027T214100Z" (UTC). Fixed width, so newer stamps also sort after older ones.
+std::wstring FormatVersionStamp(const SYSTEMTIME& utc);
+std::wstring NewVersionStamp(); // the current UTC time
+// The top-level "version" of a data/site-data.js text ("" if missing or unreadable).
+std::wstring ExtractSiteVersion(const std::string& jsText);
+// True when both texts are valid site data that differ only in their "version".
+bool SameExceptVersion(const std::string& a, const std::string& b);
+// Resolves git merge conflicts (diff3 style) in data/site-data.js whose only clash is the "version" line.
+// False (and `out` untouched) if any conflict is a real one.
+bool ResolveVersionConflicts(const std::string& text, std::string& out);
 
 // ---------------------------------------------------------------------------
 // Images (Windows Imaging Component). COM must be initialized on the calling thread.
@@ -135,6 +151,8 @@ constexpr wchar_t kDefaultRemoteUrl[] = L"https://github.com/Xavokai/CommissionS
 constexpr wchar_t kBranch[] = L"main";
 constexpr wchar_t kGitHubHost[] = L"github.com";
 constexpr wchar_t kNewTokenUrl[] = L"https://github.com/settings/personal-access-tokens/new";
+constexpr wchar_t kDefaultPagesUrl[] = L"https://xavokai.github.io/CommissionSIte/";
+constexpr wchar_t kDefaultActionsUrl[] = L"https://github.com/Xavokai/CommissionSIte/actions";
 
 enum class GitOutcome {
     Done,           // connected / pushed / synced / signed in
@@ -158,6 +176,7 @@ struct GitResult {
     std::wstring message;            // short, user-readable
     std::vector<std::wstring> files; // Conflict: files changed on both sides; Unrelated: files only on GitHub
     std::wstring account;            // sign-in: the GitHub login, when known
+    std::wstring version;            // Push (Done): the site-data "version" that was uploaded ("" if none)
 };
 
 // How to combine when GitHub and this folder both changed: ask (return Conflict/Unrelated), or take
@@ -199,7 +218,9 @@ GitResult ConnectRepo(const std::wstring& repo, const std::wstring& url, bool al
 GitResult SyncFromGitHub(const std::wstring& repo, const std::wstring& githubUser, const std::wstring& summary,
                          MergeChoice choice, const LogFn& log);
 // git add -A + commit; combines with GitHub's newer commits first (like SyncFromGitHub, but also when
-// GitHub has no site yet); then git push -u origin HEAD:main.
+// GitHub has no site yet); then git push -u origin HEAD:main. Whatever is uploaded carries a fresh
+// data/site-data.js "version" (NewVersionStamp at the start of the push), but a change of the stamp alone
+// is never committed or uploaded.
 GitResult PushChanges(const std::wstring& repo, const std::wstring& githubUser, const std::wstring& summary,
                       MergeChoice choice, const LogFn& log);
 
@@ -231,6 +252,33 @@ struct HttpResponse {
     std::wstring error;
 };
 HttpResponse HttpGet(const std::wstring& url, const std::wstring& bearerToken);
+// Plain GET that asks every cache on the way for a fresh copy (Cache-Control: no-cache); short timeouts.
+HttpResponse HttpGetFresh(const std::wstring& url);
+
+// ---------------------------------------------------------------------------
+// Waiting for GitHub Pages to publish a push
+// ---------------------------------------------------------------------------
+constexpr DWORD kLiveCheckIntervalMs = 10 * 1000;
+constexpr DWORD kLiveCheckTimeoutMs = 5 * 60 * 1000;
+
+enum class LiveOutcome { Live, TimedOut, Cancelled };
+struct LiveCheckResult {
+    LiveOutcome outcome = LiveOutcome::TimedOut;
+    std::wstring seenVersion; // the "version" the website showed last ("" = none / unreadable)
+    int attempts = 0;
+};
+// After each check: attempt number (1-based), version seen, problem ("" or e.g. "HTTP 404").
+using LiveProgressFn = std::function<void(int attempt, const std::wstring& seenVersion, const std::wstring& problem)>;
+
+// Polls <siteUrl>data/site-data.js?t=<ms> until its "version" is `version` (or newer), the time is up,
+// or `cancelEvent` is signaled. Blocks: call it from a worker thread.
+LiveCheckResult WaitUntilLive(const std::wstring& siteUrl, const std::wstring& version, HANDLE cancelEvent,
+                              DWORD intervalMs, DWORD timeoutMs, const LiveProgressFn& progress);
+// The website address for a remote URL: COMMISSION_MANAGER_PAGES_URL if set (for testing), else
+// GitHubPagesUrl(remoteUrl), else kDefaultPagesUrl.
+std::wstring SiteUrlFor(const std::wstring& remoteUrl);
+// "https://github.com/<owner>/<repo>/actions", else kDefaultActionsUrl.
+std::wstring ActionsUrlFor(const std::wstring& remoteUrl);
 
 // Pure helpers (unit-tested).
 enum class GitError { Offline, Auth, NoAccess, NotFound, NoRemoteBranch, NonFastForward, Identity, Other };
@@ -241,3 +289,9 @@ std::string CredentialRequest(const std::wstring& host, const std::wstring& user
 std::wstring CleanToken(const std::wstring& pasted); // drops whitespace/quotes picked up while copying
 bool ParseGitHubLogin(const std::string& body, std::wstring& login);
 bool GitHubRepoFromUrl(const std::wstring& url, std::wstring& owner, std::wstring& name);
+// github.com/Owner/Repo → "https://owner.github.io/Repo/" (Owner/owner.github.io → "https://owner.github.io/");
+// "" if `remoteUrl` isn't a GitHub repository address.
+std::wstring GitHubPagesUrl(const std::wstring& remoteUrl);
+// Adds "?t=<ms>" (or "&t=<ms>") so browsers and caches fetch a fresh copy.
+std::wstring WithCacheBuster(const std::wstring& url, unsigned long long ms);
+unsigned long long UnixTimeMs();

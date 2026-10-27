@@ -454,24 +454,9 @@ static std::wstring LineCol(const std::string& text, size_t pos) {
     return L"line " + std::to_wstring(line) + L", column " + std::to_wstring(col);
 }
 
-bool SiteData::Load(const std::wstring& repo, std::wstring& error) {
-    repo_ = repo;
-    while (!repo_.empty() && (repo_.back() == L'\\' || repo_.back() == L'/')) repo_.pop_back();
-    dataPath_ = RepoPath(repo_, L"data/site-data.js");
-
-    if (!DirExists(repo_)) {
-        error = L"The website folder doesn't exist:\n" + repo_ + L"\n\nUse Browse… to choose your website folder.";
-        return false;
-    }
-    if (!FileExists(dataPath_)) {
-        error = L"Couldn't find data\\site-data.js in this folder:\n" + repo_ +
-                L"\n\nThis doesn't look like your website folder. Use Browse… to choose the folder that "
-                L"contains index.html and the data folder.";
-        return false;
-    }
-
-    std::string text;
-    if (!ReadWholeFile(dataPath_, text, error)) return false;
+// Parses a whole data/site-data.js text ("<prefix>window.SITE_DATA = {…};<suffix>").
+static bool ParseSiteText(const std::string& text, json::Value& root, std::string& prefix, std::string& suffix,
+                          std::wstring& error) {
     size_t bom = (text.size() >= 3 && (unsigned char)text[0] == 0xEF && (unsigned char)text[1] == 0xBB &&
                   (unsigned char)text[2] == 0xBF) ? 3 : 0;
 
@@ -488,7 +473,6 @@ bool SiteData::Load(const std::wstring& repo, std::wstring& error) {
     }
     ++p;
 
-    json::Value root;
     std::string perr;
     if (!json::Parse(text, p, root, perr)) {
         error = L"data\\site-data.js has a formatting error at " + LineCol(text, p) + L": " + FromUtf8(perr) +
@@ -525,8 +509,34 @@ bool SiteData::Load(const std::wstring& repo, std::wstring& error) {
         }
     }
 
-    prefix_ = text.substr(bom, at - bom);
-    suffix_ = text.substr(p);
+    prefix = text.substr(bom, at - bom);
+    suffix = text.substr(p);
+    return true;
+}
+
+bool SiteData::Load(const std::wstring& repo, std::wstring& error) {
+    repo_ = repo;
+    while (!repo_.empty() && (repo_.back() == L'\\' || repo_.back() == L'/')) repo_.pop_back();
+    dataPath_ = RepoPath(repo_, L"data/site-data.js");
+
+    if (!DirExists(repo_)) {
+        error = L"The website folder doesn't exist:\n" + repo_ + L"\n\nUse Browse… to choose your website folder.";
+        return false;
+    }
+    if (!FileExists(dataPath_)) {
+        error = L"Couldn't find data\\site-data.js in this folder:\n" + repo_ +
+                L"\n\nThis doesn't look like your website folder. Use Browse… to choose the folder that "
+                L"contains index.html and the data folder.";
+        return false;
+    }
+
+    std::string text;
+    if (!ReadWholeFile(dataPath_, text, error)) return false;
+    json::Value root;
+    std::string prefix, suffix;
+    if (!ParseSiteText(text, root, prefix, suffix, error)) return false;
+    prefix_ = std::move(prefix);
+    suffix_ = std::move(suffix);
     root_ = std::move(root);
     return true;
 }
@@ -541,10 +551,9 @@ std::string SiteData::ToText() const {
     return out;
 }
 
-bool SiteData::Save(std::wstring& error) const {
-    const std::string text = ToText();
-    const std::wstring tmp = dataPath_ + L".tmp";
-
+// Atomically replaces `path` with `text` (temp file + rename).
+static bool WriteWholeFile(const std::wstring& path, const std::string& text, std::wstring& error) {
+    const std::wstring tmp = path + L".tmp";
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         error = L"Couldn't write " + tmp + L":\n" + SystemMessage(GetLastError());
@@ -562,15 +571,19 @@ bool SiteData::Save(std::wstring& error) const {
     }
     // Replace atomically; retry briefly in case an editor/antivirus holds the file.
     for (int attempt = 0;; ++attempt) {
-        if (MoveFileExW(tmp.c_str(), dataPath_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+        if (MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
         gle = GetLastError();
         if (attempt >= 10) break;
         Sleep(100);
     }
     DeleteFileW(tmp.c_str());
-    error = L"Couldn't replace " + dataPath_ + L":\n" + SystemMessage(gle) +
-            L"\n\nIs the file open in another program?";
+    error = L"Couldn't replace " + path + L":\n" + SystemMessage(gle) + L"\n\nIs the file open in another program?";
     return false;
+}
+
+bool SiteData::Save(std::wstring& error, const std::wstring& version) {
+    SetVersion(version.empty() ? NewVersionStamp() : version);
+    return WriteWholeFile(dataPath_, ToText(), error);
 }
 
 bool SiteData::CommissionsOpen() const {
@@ -580,7 +593,157 @@ bool SiteData::CommissionsOpen() const {
 
 void SiteData::SetCommissionsOpen(bool open) {
     if (json::Value* c = root_.Get("commissionsOpen")) *c = json::Value::Bool(open);
-    else root_.members.insert(root_.members.begin(), json::Member("commissionsOpen", json::Value::Bool(open)));
+    else root_.members.insert(root_.members.begin() + (root_.Get("version") ? 1 : 0),
+                              json::Member("commissionsOpen", json::Value::Bool(open)));
+}
+
+std::wstring SiteData::Version() const {
+    const json::Value* v = root_.Get("version");
+    return v && v->type == json::Value::Type::String ? FromUtf8(v->text) : std::wstring();
+}
+
+void SiteData::SetVersion(const std::wstring& version) {
+    auto& m = root_.members;
+    m.erase(std::remove_if(m.begin(), m.end(), [](const json::Member& x) { return x.first == "version"; }), m.end());
+    m.insert(m.begin(), json::Member("version", json::Value::String(ToUtf8(version))));
+}
+
+// ---------------------------------------------------------------------------
+// Version stamps
+// ---------------------------------------------------------------------------
+std::wstring FormatVersionStamp(const SYSTEMTIME& utc) {
+    wchar_t buf[32];
+    swprintf_s(buf, L"%04u%02u%02uT%02u%02u%02uZ", utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond);
+    return buf;
+}
+
+std::wstring NewVersionStamp() {
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    return FormatVersionStamp(st);
+}
+
+static bool IsVersionStamp(const std::wstring& v) {
+    if (v.size() != 16 || v[8] != L'T' || v[15] != L'Z') return false;
+    for (size_t i = 0; i < 15; ++i)
+        if (i != 8 && (v[i] < L'0' || v[i] > L'9')) return false;
+    return true;
+}
+
+std::wstring ExtractSiteVersion(const std::string& jsText) {
+    json::Value root;
+    std::string prefix, suffix;
+    std::wstring error;
+    if (ParseSiteText(jsText, root, prefix, suffix, error)) {
+        const json::Value* v = root.Get("version");
+        return v && v->type == json::Value::Type::String ? FromUtf8(v->text) : std::wstring();
+    }
+    // Not strict site data (e.g. edited by hand): look for "version": "…" directly.
+    for (size_t at = jsText.find("\"version\""); at != std::string::npos; at = jsText.find("\"version\"", at + 1)) {
+        size_t p = at + 9;
+        while (p < jsText.size() && isspace((unsigned char)jsText[p])) ++p;
+        if (p >= jsText.size() || jsText[p] != ':') continue;
+        ++p;
+        json::Value v;
+        std::string perr;
+        if (json::Parse(jsText, p, v, perr) && v.type == json::Value::Type::String) return FromUtf8(v.text);
+    }
+    return {};
+}
+
+bool SameExceptVersion(const std::string& a, const std::string& b) {
+    json::Value ra, rb;
+    std::string pa, sa, pb, sb;
+    std::wstring error;
+    if (!ParseSiteText(a, ra, pa, sa, error) || !ParseSiteText(b, rb, pb, sb, error)) return false;
+    auto strip = [](json::Value& root, std::string& prefix, std::string& suffix) {
+        auto& m = root.members;
+        m.erase(std::remove_if(m.begin(), m.end(), [](const json::Member& x) { return x.first == "version"; }), m.end());
+        for (std::string* s : {&prefix, &suffix}) s->erase(std::remove(s->begin(), s->end(), '\r'), s->end());
+    };
+    strip(ra, pa, sa);
+    strip(rb, pb, sb);
+    return pa == pb && sa == sb && json::Serialize(ra) == json::Serialize(rb);
+}
+
+namespace {
+
+// A top-level "version" member line as written by json::Serialize ("  \"version\": …").
+bool IsVersionLine(const std::string& line) { return line.compare(0, 12, "  \"version\":") == 0; }
+
+std::vector<std::string> WithoutVersionLines(const std::vector<std::string>& lines) {
+    std::vector<std::string> out;
+    for (auto& l : lines)
+        if (!IsVersionLine(l)) out.push_back(l);
+    return out;
+}
+
+// One conflict: picks the result when the sides only clash on the version line. Lines keep their '\n'.
+bool ResolveHunk(const std::vector<std::string>& ours, const std::vector<std::string>* base,
+                 const std::vector<std::string>& theirs, std::string& out) {
+    auto hasVersion = [](const std::vector<std::string>& v) { return std::any_of(v.begin(), v.end(), IsVersionLine); };
+    if (!hasVersion(ours) && !hasVersion(theirs)) return false; // a real conflict elsewhere in the file
+    const auto o = WithoutVersionLines(ours), t = WithoutVersionLines(theirs);
+    auto emit = [&out](const std::vector<std::string>& v) {
+        for (auto& l : v) out += l;
+    };
+    if (o == t) return emit(ours), true;
+    if (!base) return false;
+    const auto b = WithoutVersionLines(*base);
+    if (t == b) return emit(ours), true;   // only we changed something besides the version
+    if (o == b) return emit(theirs), true; // only they did
+    if (o.size() != b.size() || t.size() != b.size()) return false;
+    // Both changed different lines: take each changed line from the side that changed it.
+    std::vector<std::string> merged;
+    for (size_t i = 0; i < b.size(); ++i) {
+        if (o[i] == t[i] || t[i] == b[i]) merged.push_back(o[i]);
+        else if (o[i] == b[i]) merged.push_back(t[i]);
+        else return false;
+    }
+    size_t k = 0;
+    for (auto& l : ours) out += IsVersionLine(l) ? l : merged[k++];
+    return true;
+}
+
+} // namespace
+
+bool ResolveVersionConflicts(const std::string& text, std::string& out) {
+    std::vector<std::string> lines;
+    for (size_t b = 0; b < text.size();) {
+        size_t e = text.find('\n', b);
+        e = e == std::string::npos ? text.size() : e + 1;
+        lines.push_back(text.substr(b, e - b));
+        b = e;
+    }
+    auto marker = [](const std::string& l, const char* m) {
+        return l.compare(0, 7, m) == 0 && (l.size() == 7 || l[7] == ' ' || l[7] == '\r' || l[7] == '\n');
+    };
+    std::string result;
+    bool any = false;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (!marker(lines[i], "<<<<<<<")) {
+            if (marker(lines[i], "=======") || marker(lines[i], ">>>>>>>") || marker(lines[i], "|||||||")) return false;
+            result += lines[i];
+            continue;
+        }
+        std::vector<std::string> ours, base, theirs;
+        bool hasBase = false;
+        std::vector<std::string>* cur = &ours;
+        size_t j = i + 1;
+        for (; j < lines.size() && !marker(lines[j], ">>>>>>>"); ++j) {
+            if (marker(lines[j], "|||||||") && cur == &ours) { cur = &base; hasBase = true; }
+            else if (marker(lines[j], "=======") && cur != &theirs) cur = &theirs;
+            else if (marker(lines[j], "<<<<<<<")) return false;
+            else cur->push_back(lines[j]);
+        }
+        if (j >= lines.size() || cur != &theirs) return false; // unterminated
+        if (!ResolveHunk(ours, hasBase ? &base : nullptr, theirs, result)) return false;
+        any = true;
+        i = j;
+    }
+    if (!any) return false;
+    out = std::move(result);
+    return true;
 }
 
 json::Value& SiteData::Gallery() {
@@ -1296,6 +1459,64 @@ std::wstring HeadId(const std::wstring& repo) {
     return r.exitCode == 0 ? FromUtf8(TrimA(r.output)) : std::wstring();
 }
 
+const wchar_t kSiteDataFile[] = L"data/site-data.js";
+
+// The committed data/site-data.js in `rev`; false if `rev` has none.
+bool CommittedSiteData(const std::wstring& repo, const std::wstring& rev, std::string& text) {
+    RunResult r = RunGit(repo, {L"show", rev + L":" + kSiteDataFile}, LogFn(), false);
+    if (r.exitCode != 0) return false;
+    text = std::move(r.output);
+    return true;
+}
+
+// Sets "version" in this folder's data/site-data.js. False if it is missing or can't be read/written.
+bool StampSiteData(const std::wstring& repo, const std::wstring& version, const LogFn& log) {
+    if (!FileExists(RepoPath(repo, kSiteDataFile))) return false;
+    SiteData d;
+    std::wstring error;
+    if (!d.Load(repo, error) || !d.Save(error, version)) {
+        log(L"Couldn't update the version stamp in data/site-data.js: " + error.substr(0, error.find(L'\n')));
+        return false;
+    }
+    return true;
+}
+
+// True when the only uncommitted change is a new "version" stamp in data/site-data.js.
+bool OnlyVersionChanged(const std::wstring& repo) {
+    RunResult st = RunGit(repo, {L"status", L"--porcelain"}, LogFn(), false);
+    if (st.exitCode != 0) return false;
+    std::vector<std::string> lines;
+    for (size_t b = 0; b < st.output.size();) {
+        size_t e = st.output.find('\n', b);
+        if (e == std::string::npos) e = st.output.size();
+        std::string line = st.output.substr(b, e - b);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) lines.push_back(line);
+        b = e + 1;
+    }
+    if (lines.size() != 1 || lines[0].size() < 4 || lines[0].substr(3) != ToUtf8(kSiteDataFile) ||
+        (lines[0][0] != 'M' && lines[0][0] != ' ') || (lines[0][1] != 'M' && lines[0][1] != ' '))
+        return false;
+    std::string committed, current;
+    std::wstring error;
+    return CommittedSiteData(repo, L"HEAD", committed) &&
+           ReadWholeFile(RepoPath(repo, kSiteDataFile), current, error) && SameExceptVersion(committed, current);
+}
+
+// During a conflicted merge: combines data/site-data.js when the only clash is the version stamp.
+bool ResolveSiteDataMerge(const std::wstring& repo, const LogFn& log) {
+    const std::wstring path = RepoPath(repo, kSiteDataFile);
+    std::string text, resolved, prefix, suffix;
+    std::wstring error;
+    json::Value root;
+    if (!ReadWholeFile(path, text, error) || !ResolveVersionConflicts(text, resolved) ||
+        !ParseSiteText(resolved, root, prefix, suffix, error) || !WriteWholeFile(path, resolved, error))
+        return false;
+    if (RunGit(repo, {L"add", L"--", kSiteDataFile}, log).exitCode != 0) return false;
+    log(L"data/site-data.js was changed on both sides, but only its version stamps clashed: combined automatically.");
+    return true;
+}
+
 // Combines GitHub's main branch (origin/main, already fetched) into this folder. Local changes must be
 // committed first. With MergeChoice::Ask, separate histories return Unrelated and files changed on both
 // sides return Conflict (nothing is changed); otherwise such files are taken whole from the chosen side.
@@ -1325,7 +1546,8 @@ GitResult Integrate(const std::wstring& repo, MergeChoice choice, const std::vec
                              .output);
         return r;
     }
-    std::vector<std::wstring> merge = Concat(ident, {L"merge", L"--no-edit", L"-m",
+    // diff3 conflicts include the common version, so clashes of only the "version" stamp can be resolved.
+    std::vector<std::wstring> merge = Concat(ident, {L"-c", L"merge.conflictStyle=diff3", L"merge", L"--no-edit", L"-m",
                                                      unrelated ? L"Combine this folder with the files on GitHub"
                                                                : L"Combine changes from GitHub"});
     if (unrelated) merge.push_back(L"--allow-unrelated-histories");
@@ -1342,6 +1564,15 @@ GitResult Integrate(const std::wstring& repo, MergeChoice choice, const std::vec
         abort();
         if (ClassifyGitOutput(m.output) == GitError::Identity) return {GitOutcome::Failed, kIdentityHelp};
         return {GitOutcome::Failed, L"Couldn't combine GitHub's files with this folder \u2014 see the log. Nothing was changed."};
+    }
+    auto siteData = std::find(files.begin(), files.end(), std::wstring(kSiteDataFile));
+    if (siteData != files.end() && ResolveSiteDataMerge(repo, log)) files.erase(siteData);
+    if (files.empty()) {
+        if (RunGit(repo, Concat(ident, {L"commit", L"-q", L"--no-edit"}), log).exitCode != 0) {
+            abort();
+            return {GitOutcome::Failed, L"Couldn't finish combining with GitHub \u2014 see the log. Nothing was changed."};
+        }
+        return {GitOutcome::Done, L""};
     }
     if (choice == MergeChoice::Ask) {
         abort();
@@ -1490,41 +1721,91 @@ bool GitHubRepoFromUrl(const std::wstring& url, std::wstring& owner, std::wstrin
     return true;
 }
 
+std::wstring GitHubPagesUrl(const std::wstring& remoteUrl) {
+    std::wstring owner, name;
+    if (!GitHubRepoFromUrl(remoteUrl, owner, name)) return {};
+    owner = LowerAscii(owner);
+    if (LowerAscii(name) == owner + L".github.io") return L"https://" + owner + L".github.io/";
+    return L"https://" + owner + L".github.io/" + name + L"/";
+}
+
+std::wstring WithCacheBuster(const std::wstring& url, unsigned long long ms) {
+    std::wstring u = url;
+    size_t hash = u.find(L'#');
+    std::wstring fragment = hash == std::wstring::npos ? L"" : u.substr(hash);
+    if (hash != std::wstring::npos) u.resize(hash);
+    return u + (u.find(L'?') == std::wstring::npos ? L"?t=" : L"&t=") + std::to_wstring(ms) + fragment;
+}
+
+unsigned long long UnixTimeMs() {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    const unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (t - 116444736000000000ULL) / 10000; // 100 ns ticks since 1601 → ms since 1970
+}
+
+std::wstring SiteUrlFor(const std::wstring& remoteUrl) {
+    wchar_t env[1024];
+    DWORD n = GetEnvironmentVariableW(L"COMMISSION_MANAGER_PAGES_URL", env, ARRAYSIZE(env));
+    std::wstring url = n > 0 && n < ARRAYSIZE(env) ? Trim(env) : GitHubPagesUrl(remoteUrl);
+    if (url.empty()) url = kDefaultPagesUrl;
+    if (url.back() != L'/') url += L'/';
+    return url;
+}
+
+std::wstring ActionsUrlFor(const std::wstring& remoteUrl) {
+    std::wstring owner, name;
+    if (!GitHubRepoFromUrl(remoteUrl, owner, name)) return kDefaultActionsUrl;
+    return L"https://github.com/" + owner + L"/" + name + L"/actions";
+}
+
 // ---------------------------------------------------------------------------
 // HTTPS (WinHTTP)
 // ---------------------------------------------------------------------------
-HttpResponse HttpGet(const std::wstring& url, const std::wstring& bearerToken) {
+namespace {
+
+struct HttpOptions {
+    std::wstring headers; // "Name: value\r\n" lines
+    DWORD flags = 0;      // extra WinHttpOpenRequest flags
+    int resolveMs = 15000, connectMs = 15000, sendMs = 20000, receiveMs = 20000;
+};
+
+HttpResponse HttpRequest(const std::wstring& url, HttpOptions opt) {
     HttpResponse res;
     URL_COMPONENTS uc = {sizeof(uc)};
-    wchar_t host[256] = {}, path[2048] = {};
+    wchar_t host[256] = {}, path[2048] = {}, extra[2048] = {};
     uc.lpszHostName = host;
     uc.dwHostNameLength = ARRAYSIZE(host);
     uc.lpszUrlPath = path;
     uc.dwUrlPathLength = ARRAYSIZE(path);
+    uc.lpszExtraInfo = extra; // "?query"
+    uc.dwExtraInfoLength = ARRAYSIZE(extra);
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) {
         res.error = L"Invalid address: " + url;
         return res;
     }
+    const std::wstring object = std::wstring(path) + extra;
     HINTERNET session = WinHttpOpen(L"ZelRaccyCommissionManager/1.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session)
         session = WinHttpOpen(L"ZelRaccyCommissionManager/1.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
                               WINHTTP_NO_PROXY_BYPASS, 0);
     HINTERNET conn = nullptr, req = nullptr;
-    std::wstring headers = L"Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n";
-    if (!bearerToken.empty()) headers += L"Authorization: Bearer " + bearerToken + L"\r\n";
+    std::wstring& headers = opt.headers;
     bool ok = session != nullptr;
     if (ok) {
-        WinHttpSetTimeouts(session, 15000, 15000, 20000, 20000);
+        WinHttpSetTimeouts(session, opt.resolveMs, opt.connectMs, opt.sendMs, opt.receiveMs);
         conn = WinHttpConnect(session, host, uc.nPort, 0);
         ok = conn != nullptr;
     }
     if (ok) {
-        req = WinHttpOpenRequest(conn, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                 uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        req = WinHttpOpenRequest(conn, L"GET", object.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                 (uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) | opt.flags);
         ok = req != nullptr;
     }
-    ok = ok && WinHttpSendRequest(req, headers.c_str(), (DWORD)headers.size(), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+    ok = ok &&
+         WinHttpSendRequest(req, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(), (DWORD)headers.size(),
+                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
          WinHttpReceiveResponse(req, nullptr);
     if (ok) {
         DWORD status = 0, size = sizeof(status);
@@ -1546,6 +1827,73 @@ HttpResponse HttpGet(const std::wstring& url, const std::wstring& bearerToken) {
     if (conn) WinHttpCloseHandle(conn);
     if (session) WinHttpCloseHandle(session);
     return res;
+}
+
+} // namespace
+
+HttpResponse HttpGet(const std::wstring& url, const std::wstring& bearerToken) {
+    HttpOptions o;
+    o.headers = L"Accept: application/vnd.github+json\r\nX-GitHub-Api-Version: 2022-11-28\r\n";
+    if (!bearerToken.empty()) o.headers += L"Authorization: Bearer " + bearerToken + L"\r\n";
+    return HttpRequest(url, std::move(o));
+}
+
+HttpResponse HttpGetFresh(const std::wstring& url) {
+    HttpOptions o;
+    o.headers = L"Cache-Control: no-cache\r\nPragma: no-cache\r\n";
+    o.flags = WINHTTP_FLAG_REFRESH; // never answer from a cache
+    o.resolveMs = o.connectMs = o.sendMs = o.receiveMs = 8000;
+    return HttpRequest(url, std::move(o));
+}
+
+// ---------------------------------------------------------------------------
+// Waiting for GitHub Pages
+// ---------------------------------------------------------------------------
+LiveCheckResult WaitUntilLive(const std::wstring& siteUrl, const std::wstring& version, HANDLE cancelEvent,
+                              DWORD intervalMs, DWORD timeoutMs, const LiveProgressFn& progress) {
+    LiveCheckResult r;
+    std::wstring dataUrl = siteUrl;
+    if (dataUrl.empty() || dataUrl.back() != L'/') dataUrl += L'/';
+    dataUrl += L"data/site-data.js";
+    auto cancelled = [cancelEvent](DWORD waitMs) {
+        if (!cancelEvent) {
+            Sleep(waitMs);
+            return false;
+        }
+        return WaitForSingleObject(cancelEvent, waitMs) == WAIT_OBJECT_0;
+    };
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+    for (;;) {
+        if (cancelled(0)) {
+            r.outcome = LiveOutcome::Cancelled;
+            return r;
+        }
+        ++r.attempts;
+        HttpResponse resp = HttpGetFresh(WithCacheBuster(dataUrl, UnixTimeMs()));
+        std::wstring seen, problem;
+        if (resp.status == 200) {
+            seen = r.seenVersion = ExtractSiteVersion(resp.body);
+            if (seen.empty()) problem = L"its site data has no version stamp yet";
+        } else {
+            problem = resp.status ? L"HTTP " + std::to_wstring(resp.status) : resp.error;
+        }
+        // A newer stamp (a later upload, e.g. from another computer) includes this one too.
+        const bool live = !seen.empty() && (seen == version || (IsVersionStamp(seen) && IsVersionStamp(version) && seen > version));
+        if (progress) progress(r.attempts, seen, problem);
+        if (live) {
+            r.outcome = LiveOutcome::Live;
+            return r;
+        }
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            r.outcome = LiveOutcome::TimedOut;
+            return r;
+        }
+        if (cancelled((DWORD)std::min<ULONGLONG>(intervalMs, deadline - now))) {
+            r.outcome = LiveOutcome::Cancelled;
+            return r;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1826,6 +2174,18 @@ GitResult PushChanges(const std::wstring& repo, const std::wstring& githubUser, 
     CleanUpUnfinished(repo, log);
     const std::vector<std::wstring> ident = IdentityArgs(repo, githubUser);
 
+    // Every upload carries a fresh "version" in data/site-data.js, so the website (and the live check
+    // after the push) can tell the new copy from a cached one. A new stamp alone is never uploaded.
+    const std::wstring stamp = NewVersionStamp();
+    if (!TrimA(RunGit(repo, {L"status", L"--porcelain"}, LogFn(), false).output).empty()) {
+        if (info.hasCommits && OnlyVersionChanged(repo)) {
+            log(L"Only the version stamp in data/site-data.js changed, so there is nothing new to upload from this folder.");
+            RunGit(repo, {L"checkout", L"-q", L"HEAD", L"--", kSiteDataFile}, log);
+        } else if (StampSiteData(repo, stamp, log)) {
+            log(L"Version stamp for this upload: " + stamp);
+        }
+    }
+
     bool committed = false;
     if (GitResult r = CommitAll(repo, CommitMessage(info.hasCommits, summary), ident, log, committed);
         r.outcome != GitOutcome::Done)
@@ -1859,13 +2219,27 @@ GitResult PushChanges(const std::wstring& repo, const std::wstring& githubUser, 
         }
     }
 
+    // What goes up must carry this upload's stamp, also when the newest commit was made earlier (a push that
+    // failed) or GitHub's copy of the file won while combining. The unpublished newest commit is amended,
+    // so the stamp never makes a commit of its own.
+    std::string head;
+    if (CommittedSiteData(repo, L"HEAD", head) && ExtractSiteVersion(head) != stamp && StampSiteData(repo, stamp, log)) {
+        log(L"Version stamp for this upload: " + stamp);
+        if (RunGit(repo, {L"add", L"--", kSiteDataFile}, log).exitCode != 0 ||
+            RunGit(repo, Concat(ident, {L"commit", L"-q", L"--amend", L"--no-edit"}), log).exitCode != 0)
+            return {GitOutcome::Failed, L"Couldn't add the version stamp to the upload \u2014 see the log."};
+    }
+    std::wstring version;
+    if (CommittedSiteData(repo, L"HEAD", head)) version = ExtractSiteVersion(head);
+
     RunResult p = RunNetwork(repo, githubUser, {L"push", L"-u", L"origin", L"HEAD:refs/heads/main"}, log);
     if (!p.started || p.exitCode != 0 || p.killed) {
         if (!p.killed && ClassifyGitOutput(p.output) == GitError::NonFastForward)
             return {GitOutcome::Failed, L"GitHub changed while uploading. Click \u201cPush changes\u201d again."};
         return NetworkFailure(p, L"upload");
     }
-    return {GitOutcome::Done, std::wstring(L"Pushed! ") +
-                                  (downloaded ? L"(GitHub's newer files were downloaded and combined first.) " : L"") +
-                                  L"GitHub Pages usually updates the site within a minute or two."};
+    GitResult done{GitOutcome::Done, std::wstring(L"Uploaded to GitHub.") +
+                                         (downloaded ? L" (GitHub's newer files were downloaded and combined first.)" : L"")};
+    done.version = version;
+    return done;
 }

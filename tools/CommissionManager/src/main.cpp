@@ -20,6 +20,7 @@ constexpr UINT WM_APP_INIT = WM_APP + 1;
 constexpr UINT WM_APP_LOG = WM_APP + 2;      // lParam: std::wstring*
 constexpr UINT WM_APP_GITDONE = WM_APP + 3;  // lParam: GitTaskResult*
 constexpr UINT WM_APP_ACCOUNT = WM_APP + 4;  // lParam: GitHubAccount*
+constexpr UINT WM_APP_LIVE = WM_APP + 5;     // lParam: LiveMsg*
 constexpr UINT_PTR kThumbTimer = 1;
 constexpr UINT_PTR kDisabledTipOffset = 10000; // tooltip ids for the "why is this disabled" rectangles
 
@@ -58,20 +59,32 @@ enum : int {
     IDC_CONNECT,
     IDC_PUSH,
     IDC_SYNC,
+    IDC_OPEN_SITE,
     IDC_PUSH_RESULT,
     IDC_LOG,
     IDC_STATUSBAR,
+};
+
+// One "wait until the website shows the upload" check, shared by the UI and its worker thread.
+struct LiveCheck {
+    HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr); // set = stop waiting
+    LiveCheck() = default;
+    LiveCheck(const LiveCheck&) = delete;
+    LiveCheck& operator=(const LiveCheck&) = delete;
+    ~LiveCheck() {
+        if (cancel) CloseHandle(cancel);
+    }
 };
 
 struct AppState {
     HINSTANCE inst = nullptr;
     HWND hwnd = nullptr;
     UINT dpi = 96;
-    HFONT font = nullptr, fontHead = nullptr, fontBig = nullptr, fontMono = nullptr, fontBold = nullptr;
+    HFONT font = nullptr, fontHead = nullptr, fontBig = nullptr, fontMono = nullptr, fontBold = nullptr, fontLink = nullptr;
 
     HWND folderLabel{}, folder{}, browse{}, headStatus{}, toggle{}, toggleDesc{}, headGallery{}, list{}, add{},
         rename{}, remove{}, up{}, down{}, headPublish{}, steps{}, accountLabel{}, accountText{}, signIn{}, token{},
-        signOut{}, remoteLabel{}, remote{}, connect{}, push{}, sync{}, pushResult{}, log{}, status{}, tips{};
+        signOut{}, remoteLabel{}, remote{}, connect{}, push{}, sync{}, openSite{}, pushResult{}, log{}, status{}, tips{};
 
     std::wstring repo;
     SiteData data;
@@ -80,6 +93,13 @@ struct AppState {
     bool signingIn = false; // ...and it is the browser sign-in (which can be cancelled)
     std::vector<std::wstring> changes; // since last successful push → commit summary
     COLORREF pushResultColor = RGB(110, 110, 120);
+    std::wstring pushResultLink; // opened when the push result line is clicked ("" = plain text)
+
+    // Waiting for GitHub Pages after a push (see StartLiveCheck)
+    std::shared_ptr<LiveCheck> live; // the running check, if any
+    unsigned liveId = 0;             // messages from older checks are ignored
+    std::wstring liveVersion, liveSite, liveActions, liveNote;
+    ULONGLONG liveStart = 0;
 
     // GitHub state
     GitHubAccount account;
@@ -148,8 +168,11 @@ std::wstring NowText() {
 
 void SetStatus(const std::wstring& text) { SendMessageW(g.status, SB_SETTEXTW, 0, (LPARAM)text.c_str()); }
 
-void SetPushResult(const std::wstring& text, COLORREF color) {
+// The line under the Push button. With a `link`, it is underlined and opens the link when clicked.
+void SetPushResult(const std::wstring& text, COLORREF color, const std::wstring& link = L"") {
     g.pushResultColor = color;
+    g.pushResultLink = link;
+    SendMessageW(g.pushResult, WM_SETFONT, (WPARAM)(link.empty() ? g.font : g.fontLink), FALSE);
     SetWindowTextW(g.pushResult, text.c_str());
     InvalidateRect(g.pushResult, nullptr, TRUE);
 }
@@ -205,19 +228,20 @@ std::wstring CommitSummary() {
 // ---------------------------------------------------------------------------
 // Fonts & layout
 // ---------------------------------------------------------------------------
-HFONT MakeFont(int pt, int weight, const wchar_t* face) {
-    return CreateFontW(-MulDiv(pt, (int)g.dpi, 72), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+HFONT MakeFont(int pt, int weight, const wchar_t* face, bool underline = false) {
+    return CreateFontW(-MulDiv(pt, (int)g.dpi, 72), 0, 0, 0, weight, FALSE, underline, FALSE, DEFAULT_CHARSET,
                        OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, face);
 }
 
 void CreateFonts() {
-    for (HFONT f : {g.font, g.fontHead, g.fontBig, g.fontMono, g.fontBold})
+    for (HFONT f : {g.font, g.fontHead, g.fontBig, g.fontMono, g.fontBold, g.fontLink})
         if (f) DeleteObject(f);
     g.font = MakeFont(10, FW_NORMAL, L"Segoe UI");
     g.fontBold = MakeFont(10, FW_BOLD, L"Segoe UI");
     g.fontHead = MakeFont(12, FW_SEMIBOLD, L"Segoe UI");
     g.fontBig = MakeFont(15, FW_BOLD, L"Segoe UI");
     g.fontMono = MakeFont(9, FW_NORMAL, L"Consolas");
+    g.fontLink = MakeFont(10, FW_NORMAL, L"Segoe UI", true);
 }
 
 void ApplyFonts() {
@@ -229,6 +253,7 @@ void ApplyFonts() {
         0);
     for (HWND h : {g.headStatus, g.headGallery, g.headPublish}) SendMessageW(h, WM_SETFONT, (WPARAM)g.fontHead, FALSE);
     SendMessageW(g.log, WM_SETFONT, (WPARAM)g.fontMono, FALSE);
+    if (!g.pushResultLink.empty()) SendMessageW(g.pushResult, WM_SETFONT, (WPARAM)g.fontLink, FALSE);
     // The status bar doesn't grow with its font on its own.
     TEXTMETRICW tm{};
     HDC dc = GetDC(g.hwnd);
@@ -246,7 +271,7 @@ void Place(HDWP& dwp, HWND h, int x, int y, int w, int hgt) {
 
 // Buttons that explain themselves in a tooltip, also while disabled.
 std::vector<HWND> TipControls() {
-    return {g.signIn, g.token, g.signOut, g.connect, g.push, g.sync, g.toggle, g.add, g.rename, g.remove, g.up, g.down};
+    return {g.signIn, g.token, g.signOut, g.connect, g.push, g.sync, g.openSite, g.toggle, g.add, g.rename, g.remove, g.up, g.down};
 }
 
 // Disabled windows get no mouse messages, so each button also has a rectangle tool on the main window.
@@ -307,8 +332,8 @@ void Layout() {
 
     // Remaining height is shared by the gallery and the publish log. The gallery keeps room for its
     // preview first; the log shrinks before it does, and extra height goes to the gallery.
-    const int pushH = S(34), rowH = btnH + S(8), stepsH = S(30), sectionGap = S(14);
-    const int avail = H - m - y - sectionGap - headGap - stepsH - 2 * rowH - pushH - S(10);
+    const int pushH = S(34), rowH = btnH + S(8), stepsH = S(30), sectionGap = S(14), resultH = S(26);
+    const int avail = H - m - y - sectionGap - headGap - stepsH - 2 * rowH - pushH - resultH - S(10);
     int logH = S(120), galH = avail - logH;
     if (galH < S(250)) {
         logH = std::max(S(64), avail - S(250));
@@ -351,8 +376,10 @@ void Layout() {
     y += rowH;
     Place(dwp, g.push, m, y, S(170), pushH);
     Place(dwp, g.sync, m + S(180), y, S(170), pushH);
-    Place(dwp, g.pushResult, m + S(362), y + S(6), W - 2 * m - S(362), S(24));
-    y += pushH + S(10);
+    Place(dwp, g.openSite, W - m - S(182), y, S(182), pushH);
+    y += pushH + S(4);
+    Place(dwp, g.pushResult, m, y, W - 2 * m, resultH - S(4));
+    y += resultH + S(6);
     Place(dwp, g.log, m, y, W - 2 * m, logH);
     EndDeferWindowPos(dwp);
     UpdateTipRects();
@@ -391,6 +418,9 @@ const wchar_t kNoGitHelp[] = L"Git isn't installed, so changes can't be publishe
                              L"then restart this app.";
 
 bool RemoteNeedsSignIn() { return _wcsnicmp(Trim(GetText(g.remote)).c_str(), L"https://", 8) == 0; }
+
+// The GitHub address the website is published from: the folder's "origin", else the address in step 2.
+std::wstring SiteRemoteUrl() { return g.repoInfo.originUrl.empty() ? Trim(GetText(g.remote)) : g.repoInfo.originUrl; }
 
 // The first reason that applies, or "" when the control can be used.
 std::wstring WhyNot(std::initializer_list<std::pair<bool, std::wstring>> checks) {
@@ -453,6 +483,8 @@ void UpdateButtons() {
            L"Upload every change in this folder to GitHub (GitHub's newer changes are downloaded and combined first).");
     Enable(g.sync, WhyNot({{!git, noGit}, {g.busy, busy}, {!g.connected, L"Connect this folder to GitHub first (step 2)."}}),
            L"Download what's on GitHub (site data and gallery images) into this folder.");
+    Enable(g.openSite, L"", L"Open your website (" + SiteUrlFor(SiteRemoteUrl()) +
+                                L") in your web browser \u2014 always the newest copy, not an old one the browser kept.");
     HWND focus = GetFocus();
     if (!focus || (focus != g.hwnd && !IsWindowEnabled(focus))) SetFocus(g.loaded ? g.list : g.browse);
 }
@@ -584,9 +616,14 @@ void ShowStateHint() {
         SetPushResult(L"\u2714 GitHub has everything in this folder.", kOpen);
 }
 
+void CancelLiveCheck();
+
 // Loads site data from `path`. Shows a message box on failure when `interactive`.
 bool LoadRepo(const std::wstring& path, bool interactive) {
-    if (path != g.repo) g.changes.clear();
+    if (path != g.repo) {
+        g.changes.clear();
+        CancelLiveCheck();
+    }
     g.repo = path;
     SiteData d;
     std::wstring err;
@@ -907,9 +944,108 @@ struct GitTaskResult {
     bool automatic; // started by the app itself (startup check): no pop-ups
 };
 
+// ---- Waiting for GitHub Pages ----------------------------------------------------------------------
+struct LiveMsg {
+    unsigned id;
+    bool done;
+    int attempt;
+    std::wstring seen, problem;
+    LiveOutcome outcome;
+};
+
+// Opens a web page. `fresh` adds "?t=<ms>", so the browser loads the newest copy of the website.
+void OpenUrl(const std::wstring& url, bool fresh) {
+    const std::wstring target = fresh ? WithCacheBuster(url, UnixTimeMs()) : url;
+    ShellExecuteW(g.hwnd, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void OnOpenWebsite() {
+    const std::wstring url = SiteUrlFor(SiteRemoteUrl());
+    AppendLog(L"Opening " + url + L" (newest copy) in your web browser.");
+    OpenUrl(url, true);
+}
+
+void CancelLiveCheck() {
+    if (g.live) SetEvent(g.live->cancel);
+    g.live.reset();
+    ++g.liveId;
+}
+
+std::wstring ElapsedText() {
+    const ULONGLONG s = (GetTickCount64() - g.liveStart) / 1000;
+    wchar_t buf[32];
+    swprintf_s(buf, L"%llu:%02llu", s / 60, s % 60);
+    return buf;
+}
+
+// After a push: checks the website every 10 s (up to 5 min, on a worker thread) until it shows `version`.
+void StartLiveCheck(const std::wstring& version) {
+    CancelLiveCheck();
+    auto check = std::make_shared<LiveCheck>();
+    g.live = check;
+    const unsigned id = g.liveId;
+    g.liveVersion = version;
+    g.liveSite = SiteUrlFor(SiteRemoteUrl());
+    g.liveActions = ActionsUrlFor(SiteRemoteUrl());
+    g.liveStart = GetTickCount64();
+    g.liveNote.clear();
+    const std::wstring waiting = L"Uploaded \u2714 \u2014 waiting for GitHub Pages to publish\u2026";
+    SetPushResult(waiting, kAccent);
+    SetStatus(waiting);
+    AppendLog(waiting + L" (checking " + g.liveSite + L" for version " + version +
+              L" every 10 seconds, for up to 5 minutes)");
+    HWND hwnd = g.hwnd;
+    const std::wstring site = g.liveSite;
+    std::thread([check, id, hwnd, site, version] {
+        auto post = [hwnd](LiveMsg* m) {
+            if (!PostMessageW(hwnd, WM_APP_LIVE, 0, (LPARAM)m)) delete m;
+        };
+        LiveCheckResult r = WaitUntilLive(site, version, check->cancel, kLiveCheckIntervalMs, kLiveCheckTimeoutMs,
+                                          [&](int attempt, const std::wstring& seen, const std::wstring& problem) {
+                                              post(new LiveMsg{id, false, attempt, seen, problem, LiveOutcome::TimedOut});
+                                          });
+        if (r.outcome != LiveOutcome::Cancelled) post(new LiveMsg{id, true, r.attempts, r.seenVersion, L"", r.outcome});
+    }).detach();
+}
+
+void OnLiveMsg(LiveMsg* raw) {
+    std::unique_ptr<LiveMsg> m(raw);
+    if (m->id != g.liveId || !g.live) return; // cancelled meanwhile
+    const std::wstring elapsed = ElapsedText();
+    if (!m->done) {
+        if (m->problem.empty() && !m->seen.empty() && m->seen >= g.liveVersion) return; // "Live" follows
+        std::wstring note = !m->problem.empty() ? L"the website isn't showing the new version yet (" + m->problem + L")"
+                                                : L"the website still shows the previous version (" + m->seen + L")";
+        SetPushResult(L"Uploaded \u2714 \u2014 waiting for GitHub Pages to publish\u2026 (" + elapsed + L")", kAccent);
+        SetStatus(L"Waiting for GitHub Pages (" + elapsed + L", check " + std::to_wstring(m->attempt) + L"): " + note + L".");
+        if (note != g.liveNote) AppendLog(L"  " + NowText() + L"  " + note);
+        g.liveNote = note;
+        return;
+    }
+    g.live.reset();
+    if (m->outcome == LiveOutcome::Live) {
+        const std::wstring live = L"Live on the website \u2714 (version " + m->seen + L")";
+        SetPushResult(live + L" \u2014 click to open it", kOpen, g.liveSite);
+        SetStatus(live + L" at " + NowText() + L".");
+        AppendLog(live + L", " + elapsed + L" after uploading.");
+        AppendLog(L"");
+    } else {
+        SetPushResult(L"Uploaded, but the website hasn't updated after 5 minutes \u2014 click to see GitHub's progress",
+                      kAccent, g.liveActions);
+        SetStatus(L"The website hasn't shown the new version yet (checked for 5 minutes).");
+        AppendLog(L"GitHub has your changes, but after 5 minutes the website still showed " +
+                  (m->seen.empty() ? std::wstring(L"an older copy") : L"the previous version (" + m->seen + L")") +
+                  L". GitHub Pages is sometimes slow; it usually catches up within a few more minutes. You can watch "
+                  L"its progress here (or click the message under \u201cPush changes\u201d):\n  " + g.liveActions +
+                  L"\nLater, click \u201cOpen website\u201d to see the newest copy.");
+        AppendLog(L"");
+    }
+}
+
 // Runs `work` on a worker thread; output streams into the log, the result arrives as WM_APP_GITDONE.
 void RunGitTask(GitTask task, const std::wstring& title, std::function<GitResult(const LogFn&)> work,
                 bool automatic = false) {
+    CancelLiveCheck(); // the line under the Push button is needed for this task now
     g.busy = true;
     UpdateButtons();
     UpdateAccountText();
@@ -1248,6 +1384,7 @@ void OnGitDone(GitTaskResult* r) {
         LoadRepo(g.repo, !automatic); // GitHub may have changed the site data and images
         SetPushResult(L"\u2714 " + res.message, kOpen);
         SetStatus(what + L" finished at " + NowText() + L".");
+        if (task == GitTask::Push && !res.version.empty()) StartLiveCheck(res.version);
         break;
     case GitOutcome::NothingToDo:
         if (task == GitTask::Push) g.changes.clear();
@@ -1509,7 +1646,8 @@ void CreateControls() {
     g.connect = Ctl(L"BUTTON", L"&Connect folder\u2026", WS_TABSTOP | BS_PUSHBUTTON, IDC_CONNECT);
     g.push = Ctl(L"BUTTON", L"&Push changes", WS_TABSTOP | BS_PUSHBUTTON, IDC_PUSH);
     g.sync = Ctl(L"BUTTON", L"S&ync from GitHub", WS_TABSTOP | BS_PUSHBUTTON, IDC_SYNC);
-    g.pushResult = Ctl(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX, IDC_PUSH_RESULT);
+    g.openSite = Ctl(L"BUTTON", L"Open &website", WS_TABSTOP | BS_PUSHBUTTON, IDC_OPEN_SITE);
+    g.pushResult = Ctl(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS | SS_NOPREFIX | SS_NOTIFY, IDC_PUSH_RESULT);
     g.log = Ctl(L"EDIT", L"", WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_LOG,
                 WS_EX_CLIENTEDGE);
     SendMessageW(g.log, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
@@ -1625,6 +1763,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_CONNECT: OnConnect(); return 0;
         case IDC_PUSH: OnPush(MergeChoice::Ask); return 0;
         case IDC_SYNC: OnSync(MergeChoice::Ask, false); return 0;
+        case IDC_OPEN_SITE: OnOpenWebsite(); return 0;
+        case IDC_PUSH_RESULT:
+            if (HIWORD(wp) == STN_CLICKED && !g.pushResultLink.empty()) OpenUrl(g.pushResultLink, g.pushResultLink == g.liveSite);
+            return 0;
         case IDC_REMOTE:
             if (HIWORD(wp) == EN_KILLFOCUS) {
                 RemoteUrlText();
@@ -1672,10 +1814,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         OnAccountChecked(reinterpret_cast<GitHubAccount*>(lp));
         return 0;
 
+    case WM_APP_LIVE:
+        OnLiveMsg(reinterpret_cast<LiveMsg*>(lp));
+        return 0;
+
+    case WM_SETCURSOR:
+        if ((HWND)wp == g.pushResult && !g.pushResultLink.empty()) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+
     case WM_CLOSE:
         if (g.busy && Message(L"Git is still working. Quit anyway?", MB_ICONWARNING | MB_YESNO) != IDYES)
             return 0;
         if (g.signingIn) CancelSignIn();
+        CancelLiveCheck();
         DestroyWindow(hwnd);
         return 0;
 

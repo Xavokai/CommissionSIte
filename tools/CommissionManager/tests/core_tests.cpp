@@ -1,10 +1,12 @@
 // Console tests for the non-UI core. Never point these at the real website folder.
 //   core_tests json
 //   core_tests logic                            (pure helpers: error classification, credential parsing…)
+//   core_tests version                          (pure helpers: version stamps, website address, conflicts)
 //   core_tests site <repo-copy> <image-dir>    (image-dir: big.png, alpha.png, photo.jpg)
 //   core_tests git  <sandbox-dir>               (creates its own repos + local bare "GitHub")
 //   core_tests cred                             (saves + removes a credential for a fake host)
 //   core_tests api                              (read-only, unauthenticated api.github.com checks)
+//   core_tests live <base-url> <served-dir>     (<served-dir> is served at <base-url>, e.g. by python -m http.server)
 #include "../src/core.h"
 
 #include <objbase.h>
@@ -13,6 +15,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 
 static int g_failures = 0;
 
@@ -23,6 +26,7 @@ static int g_failures = 0;
     } while (0)
 
 static void Log(const std::wstring& line) { std::printf("    | %s\n", ToUtf8(line).c_str()); }
+static std::string ReadText(const std::wstring& path);
 
 static bool ParseAll(const std::string& s, json::Value& v) {
     size_t pos = 0;
@@ -90,6 +94,11 @@ static void TestSite(const std::wstring& repo, const std::wstring& images) {
     d.Remove(d.Count() - 1);       // drop "Small photo"
     CHECK(d.Save(err));
     CHECK(!FileExists(d.DataPath() + L".tmp"));
+    CHECK(d.Version().size() == 16 && d.ToText().rfind("window.SITE_DATA = {\n  \"version\": \"", 0) == 0);
+    d.SetCommissionsOpen(open0);
+    d.SetCommissionsOpen(!open0); // re-setting keeps "version" first
+    CHECK(d.Save(err, L"20261027T214100Z") && d.Version() == L"20261027T214100Z");
+    CHECK(ExtractSiteVersion(ReadText(d.DataPath())) == L"20261027T214100Z");
 
     SiteData r;
     CHECK(r.Load(repo, err));
@@ -152,6 +161,100 @@ static void TestLogic() {
     CHECK(!s.Unpublished());
     s.ahead = 1;
     CHECK(s.Unpublished());
+}
+
+// ---------------------------------------------------------------------------
+static void TestVersion() {
+    std::printf("[version]\n");
+    SYSTEMTIME t = {};
+    t.wYear = 2026; t.wMonth = 10; t.wDay = 27; t.wHour = 21; t.wMinute = 41; t.wSecond = 0;
+    CHECK(FormatVersionStamp(t) == L"20261027T214100Z");
+    t.wYear = 2027; t.wMonth = 1; t.wDay = 2; t.wHour = 3; t.wMinute = 4; t.wSecond = 5;
+    CHECK(FormatVersionStamp(t) == L"20270102T030405Z");
+    const std::wstring now = NewVersionStamp();
+    CHECK(now.size() == 16 && now[8] == L'T' && now[15] == L'Z' && now > L"20260101T000000Z");
+
+    CHECK(GitHubPagesUrl(L"https://github.com/Xavokai/CommissionSIte.git") == L"https://xavokai.github.io/CommissionSIte/");
+    CHECK(GitHubPagesUrl(L"git@github.com:Xavokai/CommissionSIte.git") == L"https://xavokai.github.io/CommissionSIte/");
+    CHECK(GitHubPagesUrl(L"https://Xavokai@github.com/Xavokai/CommissionSIte/") == L"https://xavokai.github.io/CommissionSIte/");
+    CHECK(GitHubPagesUrl(L"https://github.com/Xavokai/xavokai.github.io") == L"https://xavokai.github.io/");
+    CHECK(GitHubPagesUrl(L"C:\\temp\\github.git").empty());
+    CHECK(GitHubPagesUrl(L"https://example.com/a/b.git").empty());
+    CHECK(ActionsUrlFor(L"https://github.com/Someone/Site.git") == L"https://github.com/Someone/Site/actions");
+    CHECK(ActionsUrlFor(L"C:\\temp\\github.git") == kDefaultActionsUrl);
+    SetEnvironmentVariableW(L"COMMISSION_MANAGER_PAGES_URL", nullptr);
+    CHECK(SiteUrlFor(L"https://github.com/Someone/Site.git") == L"https://someone.github.io/Site/");
+    CHECK(SiteUrlFor(L"C:\\temp\\github.git") == kDefaultPagesUrl);
+    SetEnvironmentVariableW(L"COMMISSION_MANAGER_PAGES_URL", L"http://127.0.0.1:8765");
+    CHECK(SiteUrlFor(L"https://github.com/Someone/Site.git") == L"http://127.0.0.1:8765/");
+    SetEnvironmentVariableW(L"COMMISSION_MANAGER_PAGES_URL", nullptr);
+
+    CHECK(WithCacheBuster(L"https://xavokai.github.io/CommissionSIte/", 1761601260000ULL) ==
+          L"https://xavokai.github.io/CommissionSIte/?t=1761601260000");
+    CHECK(WithCacheBuster(L"https://x.github.io/s/data/site-data.js?a=1", 5) == L"https://x.github.io/s/data/site-data.js?a=1&t=5");
+    CHECK(WithCacheBuster(L"https://x.github.io/s/#gallery", 7) == L"https://x.github.io/s/?t=7#gallery");
+    const unsigned long long ms = UnixTimeMs();
+    CHECK(ms > 1761600000000ULL && ms < 4102444800000ULL);
+
+    const std::string stamped = "window.SITE_DATA = {\n  \"version\": \"20261027T214100Z\",\n  \"commissionsOpen\": true,\n"
+                                "  \"gallery\": []\n};\n";
+    CHECK(ExtractSiteVersion(stamped) == L"20261027T214100Z");
+    CHECK(ExtractSiteVersion("\xEF\xBB\xBF// data\r\nwindow.SITE_DATA = {\"gallery\":[],\"version\":\"v2\"};") == L"v2");
+    CHECK(ExtractSiteVersion("window.SITE_DATA = { commissionsOpen: true, \"version\": \"20261027T214100Z\" };") ==
+          L"20261027T214100Z"); // not strict JSON: found directly
+    CHECK(ExtractSiteVersion("window.SITE_DATA = {\n  \"commissionsOpen\": true\n};\n").empty());
+    CHECK(ExtractSiteVersion("<!doctype html><h1>404</h1>").empty());
+
+    const std::string other = "window.SITE_DATA = {\n  \"version\": \"20261028T000000Z\",\n  \"commissionsOpen\": true,\n"
+                              "  \"gallery\": []\n};\r\n";
+    const std::string unstamped = "window.SITE_DATA = {\n  \"commissionsOpen\": true,\n  \"gallery\": []\n};\n";
+    CHECK(SameExceptVersion(stamped, other));
+    CHECK(SameExceptVersion(stamped, unstamped));
+    CHECK(!SameExceptVersion(stamped, "window.SITE_DATA = {\n  \"version\": \"20261027T214100Z\",\n  \"commissionsOpen\": false,\n"
+                                      "  \"gallery\": []\n};\n"));
+    CHECK(!SameExceptVersion(stamped, "not site data"));
+
+    // Merge conflicts (diff3 style) where only the version clashes are combined; real ones are not.
+    const std::string toggledHere =
+        "window.SITE_DATA = {\n"
+        "<<<<<<< HEAD\n  \"version\": \"20261027T220000Z\",\n  \"commissionsOpen\": false,\n"
+        "||||||| base\n  \"version\": \"20261027T210000Z\",\n  \"commissionsOpen\": true,\n"
+        "=======\n  \"version\": \"20261027T215000Z\",\n  \"commissionsOpen\": true,\n"
+        ">>>>>>> origin/main\n"
+        "  \"gallery\": [\n    { \"name\": \"Ember\", \"file\": \"assets/gallery/ember.webp\" },\n"
+        "    { \"name\": \"New\", \"file\": \"assets/gallery/new.webp\" }\n  ]\n};\n";
+    std::string out;
+    CHECK(ResolveVersionConflicts(toggledHere, out));
+    CHECK(out == "window.SITE_DATA = {\n  \"version\": \"20261027T220000Z\",\n  \"commissionsOpen\": false,\n"
+                 "  \"gallery\": [\n    { \"name\": \"Ember\", \"file\": \"assets/gallery/ember.webp\" },\n"
+                 "    { \"name\": \"New\", \"file\": \"assets/gallery/new.webp\" }\n  ]\n};\n");
+    CHECK(ExtractSiteVersion(out) == L"20261027T220000Z");
+    const std::string toggledThere =
+        "window.SITE_DATA = {\r\n<<<<<<< HEAD\r\n  \"version\": \"A\",\r\n  \"commissionsOpen\": true,\r\n"
+        "||||||| base\r\n  \"version\": \"B\",\r\n  \"commissionsOpen\": true,\r\n"
+        "=======\r\n  \"version\": \"C\",\r\n  \"commissionsOpen\": false,\r\n>>>>>>> theirs\r\n  \"gallery\": []\r\n};\r\n";
+    CHECK(ResolveVersionConflicts(toggledThere, out) && out.find("\"commissionsOpen\": false") != std::string::npos &&
+          out.find("<<<") == std::string::npos);
+    const std::string bothDifferentLines = // each side changed a different line next to the version
+        "window.SITE_DATA = {\n<<<<<<< HEAD\n  \"version\": \"A\",\n  \"commissionsOpen\": false,\n  \"title\": \"x\",\n"
+        "||||||| base\n  \"version\": \"B\",\n  \"commissionsOpen\": true,\n  \"title\": \"x\",\n"
+        "=======\n  \"version\": \"C\",\n  \"commissionsOpen\": true,\n  \"title\": \"y\",\n>>>>>>> theirs\n"
+        "  \"gallery\": []\n};\n";
+    CHECK(ResolveVersionConflicts(bothDifferentLines, out) &&
+          out == "window.SITE_DATA = {\n  \"version\": \"A\",\n  \"commissionsOpen\": false,\n  \"title\": \"y\",\n"
+                 "  \"gallery\": []\n};\n");
+    const std::string realConflict =
+        "window.SITE_DATA = {\n<<<<<<< HEAD\n  \"version\": \"A\",\n  \"commissionsOpen\": false,\n"
+        "||||||| base\n  \"version\": \"B\",\n  \"commissionsOpen\": true,\n"
+        "=======\n  \"version\": \"C\",\n  \"commissionsOpen\": null,\n>>>>>>> theirs\n  \"gallery\": []\n};\n";
+    out = "unchanged";
+    CHECK(!ResolveVersionConflicts(realConflict, out) && out == "unchanged");
+    const std::string renameConflict = // a conflict without the version line stays a conflict
+        "window.SITE_DATA = {\n  \"version\": \"A\",\n  \"gallery\": [\n<<<<<<< HEAD\n    { \"name\": \"Mine\" }\n"
+        "||||||| base\n    { \"name\": \"Old\" }\n=======\n    { \"name\": \"Theirs\" }\n>>>>>>> theirs\n  ]\n};\n";
+    CHECK(!ResolveVersionConflicts(renameConflict, out));
+    CHECK(!ResolveVersionConflicts(stamped, out)); // nothing to resolve
+    CHECK(!ResolveVersionConflicts("<<<<<<< HEAD\n  \"version\": \"A\",\n=======\n", out)); // unterminated
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +339,16 @@ static std::wstring Head(const std::wstring& dir) {
     return FromUtf8(s);
 }
 
+// Output of a shell command run in `dir` (stdout only).
+static std::string Capture(const std::wstring& dir, const std::wstring& cmd) {
+    std::wstring tmp = dir + L"\\..\\capture.txt";
+    _wsystem((L"cmd /c \"cd /d \"" + dir + L"\" && " + cmd + L" > \"" + tmp + L"\" 2>nul\"").c_str());
+    std::string s = ReadText(tmp);
+    DeleteFileW(tmp.c_str());
+    s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());
+    return s;
+}
+
 static void TestGit(const std::wstring& sandbox) {
     std::printf("[git] %s\n", ToUtf8(sandbox).c_str());
     CreateDirectoryW(sandbox.c_str(), nullptr);
@@ -260,7 +373,8 @@ static void TestGit(const std::wstring& sandbox) {
     // This folder: its own, older history (no shared commit), no upstream, a stale origin/main from the
     // deleted repository, uncommitted edits and new untracked files that must be published.
     MakeSite(site);
-    CHECK(Sh(site, L"git init -q -b main && git add LICENSE && git commit -qm \"Initial commit\"") == 0);
+    // An older date, so this commit can never be identical to GitHub's "Initial commit" made in the same second.
+    CHECK(Sh(site, L"git init -q -b main && git add LICENSE && git commit -qm \"Initial commit\" --date=2024-01-01T12:00:00") == 0);
     CHECK(Sh(site, L"git add -A && git commit -qm \"added tingy\" && git commit -q --allow-empty -m \"Initial site upload\"") == 0);
     CHECK(Sh(site, L"git remote add origin \"" + bare + L"\" && git update-ref refs/remotes/origin/main HEAD~1") == 0);
     WriteText(site + L"\\README.md", "# site (edited)\n");
@@ -298,6 +412,32 @@ static void TestGit(const std::wstring& sandbox) {
     CHECK(Step("push again", PushChanges(site, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::NothingToDo);
     CHECK(Step("sync when up to date", SyncFromGitHub(site, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::NothingToDo);
 
+    // ---- Version stamp: every upload carries a fresh one; a new stamp alone is never uploaded -----
+    const wchar_t kShowData[] = L"git --git-dir=github.git show main:data/site-data.js";
+    const std::wstring ver0 = ExtractSiteVersion(Capture(sandbox, kShowData));
+    CHECK(ver0.size() == 16 && ExtractSiteVersion(ReadText(site + L"\\data\\site-data.js")) == ver0);
+    Sleep(1100);
+    SiteData sd;
+    CHECK(sd.Load(site, err) && sd.Save(err) && sd.Version() > ver0); // only the stamp changes
+    CHECK(Step("push only a new stamp", PushChanges(site, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::NothingToDo);
+    CHECK(!GetPublishState(site).localChanges && ExtractSiteVersion(ReadText(site + L"\\data\\site-data.js")) == ver0);
+    Sleep(1100);
+    WriteText(site + L"\\index.html", "<!doctype html><title>edited by hand</title>\n"); // not by the app
+    GitResult pv = Step("push a hand-edited page", PushChanges(site, me, L"page", MergeChoice::Ask, Log));
+    const std::wstring ver1 = ExtractSiteVersion(Capture(sandbox, kShowData));
+    CHECK(pv.outcome == GitOutcome::Done && pv.version == ver1 && ver1 > ver0);
+    CHECK(Capture(sandbox, L"git --git-dir=github.git log -1 --format=%s main") == "Update site: page\n");
+    CHECK(Capture(sandbox, L"git --git-dir=github.git diff --name-only main~1 main") == "data/site-data.js\nindex.html\n");
+    CHECK(!GetPublishState(site).Unpublished());
+    Sleep(1100);
+    WriteText(site + L"\\script.js", "console.log('committed by hand');\n");
+    CHECK(Sh(site, L"git commit -qam \"hand commit\"") == 0); // e.g. a push that failed earlier
+    pv = Step("push a commit made by hand", PushChanges(site, me, L"", MergeChoice::Ask, Log));
+    const std::wstring ver2 = ExtractSiteVersion(Capture(sandbox, kShowData));
+    CHECK(pv.outcome == GitOutcome::Done && pv.version == ver2 && ver2 > ver1);
+    CHECK(Capture(sandbox, L"git --git-dir=github.git log -2 --format=%s main") == "hand commit\nUpdate site: page\n");
+    CHECK(!GetPublishState(site).Unpublished());
+
     // ---- Another computer: empty folder → connect → sync downloads the site -----------------------
     CreateDirectoryW(fresh.c_str(), nullptr);
     CHECK(Step("connect fresh", ConnectRepo(fresh, bare, false, Log)).outcome == GitOutcome::Done);
@@ -324,6 +464,28 @@ static void TestGit(const std::wstring& sandbox) {
     CHECK(Step("push while behind", PushChanges(site, me, L"commissions open", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
     CHECK(ReadText(site + L"\\index.html").find("from fresh") != std::string::npos);
     CHECK(Sh(sandbox, L"git --git-dir=github.git show main:data/site-data.js | findstr /c:\"\\\"commissionsOpen\\\": true\"") == 0);
+
+    // ---- Both sides changed data/site-data.js in different places: their version stamps clash, but
+    //      that is combined automatically, without asking ----------------------------------------------
+    CHECK(Step("sync fresh", SyncFromGitHub(fresh, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
+    CHECK(d.Load(fresh, err));
+    d.SetCommissionsOpen(false);
+    CHECK(d.Save(err));
+    CHECK(Step("push toggle from fresh", PushChanges(fresh, me, L"commissions closed", MergeChoice::Ask, Log)).outcome ==
+          GitOutcome::Done);
+    Sleep(1100);
+    CHECK(d.Load(site, err));
+    const size_t count0 = d.Count();
+    d.Add(L"Nyxen", L"assets/gallery/nyxen.webp");
+    CHECK(d.Save(err));
+    const std::wstring mine = d.Version();
+    r = Step("push gallery change (stamps clash)", PushChanges(site, me, L"added Nyxen", MergeChoice::Ask, Log));
+    const std::string remoteData = Capture(sandbox, kShowData);
+    CHECK(r.outcome == GitOutcome::Done && r.version == ExtractSiteVersion(remoteData) && r.version >= mine);
+    CHECK(remoteData.find("\"commissionsOpen\": false") != std::string::npos && remoteData.find("Nyxen") != std::string::npos);
+    CHECK(remoteData.rfind("window.SITE_DATA = {\n  \"version\": ", 0) == 0);
+    CHECK(d.Load(site, err) && d.Count() == count0 + 1 && !d.CommissionsOpen() && d.Version() == r.version);
+    CHECK(!GetPublishState(site).Unpublished());
 
     // ---- Same line changed on both sides: ask, nothing changes; then each choice -----------------
     CHECK(Step("sync fresh", SyncFromGitHub(fresh, me, L"", MergeChoice::Ask, Log)).outcome == GitOutcome::Done);
@@ -406,6 +568,64 @@ static void TestGit(const std::wstring& sandbox) {
     CHECK(GetTickCount64() - t0 < 60000);
 }
 
+// `served` is the folder a local web server (e.g. python -m http.server) publishes at `base`.
+static void TestLive(const std::wstring& base, const std::wstring& served) {
+    std::printf("[live] %s -> %s\n", ToUtf8(base).c_str(), ToUtf8(served).c_str());
+    CreateDirectoryW((served + L"\\data").c_str(), nullptr);
+    const std::wstring file = served + L"\\data\\site-data.js";
+    auto publish = [&](const char* version) {
+        WriteText(file, std::string("window.SITE_DATA = {\n  \"version\": \"") + version +
+                            "\",\n  \"commissionsOpen\": true,\n  \"gallery\": []\n};\n");
+    };
+    auto progress = [](int attempt, const std::wstring& seen, const std::wstring& problem) {
+        std::printf("    | check %d: version=%s %s\n", attempt, ToUtf8(seen).c_str(), ToUtf8(problem).c_str());
+    };
+    publish("20261027T210000Z");
+    LiveCheckResult r = WaitUntilLive(base, L"20261027T210000Z", nullptr, 200, 2000, progress);
+    CHECK(r.outcome == LiveOutcome::Live && r.attempts == 1 && r.seenVersion == L"20261027T210000Z");
+    // The website already shows a later upload (e.g. from another computer): that includes ours.
+    r = WaitUntilLive(base, L"20261027T200000Z", nullptr, 200, 2000, progress);
+    CHECK(r.outcome == LiveOutcome::Live && r.attempts == 1);
+
+    // Published while waiting.
+    HANDLE cancel = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::thread later([&] {
+        Sleep(1500);
+        publish("20261027T220000Z");
+    });
+    ULONGLONG t0 = GetTickCount64();
+    r = WaitUntilLive(base, L"20261027T220000Z", cancel, 500, 10000, progress);
+    later.join();
+    CHECK(r.outcome == LiveOutcome::Live && r.attempts >= 2 && r.seenVersion == L"20261027T220000Z");
+    CHECK(GetTickCount64() - t0 < 6000);
+
+    // Never published: gives up after the timeout.
+    t0 = GetTickCount64();
+    r = WaitUntilLive(base, L"20261027T230000Z", cancel, 300, 1500, progress);
+    CHECK(r.outcome == LiveOutcome::TimedOut && r.seenVersion == L"20261027T220000Z" && r.attempts >= 3);
+    CHECK(GetTickCount64() - t0 < 4000);
+
+    // Cancelled (window closed) while waiting between checks: stops at once.
+    std::thread closer([&] {
+        Sleep(700);
+        SetEvent(cancel);
+    });
+    t0 = GetTickCount64();
+    r = WaitUntilLive(base, L"20261027T230000Z", cancel, kLiveCheckIntervalMs, kLiveCheckTimeoutMs, progress);
+    closer.join();
+    CHECK(r.outcome == LiveOutcome::Cancelled && r.attempts == 1 && GetTickCount64() - t0 < 2000);
+    CloseHandle(cancel);
+
+    // No site there (404) / server unreachable: keeps trying, then times out.
+    r = WaitUntilLive(base + L"no-site-here/", L"20261027T230000Z", nullptr, 200, 700, progress);
+    CHECK(r.outcome == LiveOutcome::TimedOut && r.seenVersion.empty());
+    r = WaitUntilLive(L"http://127.0.0.1:9/", L"20261027T230000Z", nullptr, 200, 700, progress);
+    CHECK(r.outcome == LiveOutcome::TimedOut && r.seenVersion.empty());
+
+    HttpResponse fresh = HttpGetFresh(WithCacheBuster(base + L"data/site-data.js", UnixTimeMs()));
+    CHECK(fresh.status == 200 && ExtractSiteVersion(fresh.body) == L"20261027T220000Z");
+}
+
 // Saves and removes a credential for a host that can't exist, through the user's real credential helper.
 static void TestCred() {
     std::printf("[cred]\n");
@@ -439,12 +659,15 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring mode = argc > 1 ? argv[1] : L"";
     if (mode == L"json") TestJson();
     else if (mode == L"logic") TestLogic();
+    else if (mode == L"version") TestVersion();
     else if (mode == L"site" && argc > 3) TestSite(argv[2], argv[3]);
     else if (mode == L"git" && argc > 2) TestGit(argv[2]);
     else if (mode == L"cred") TestCred();
     else if (mode == L"api") TestApi();
+    else if (mode == L"live" && argc > 3) TestLive(argv[2], argv[3]);
     else {
-        std::printf("usage: core_tests json | logic | site <repo-copy> <image-dir> | git <sandbox-dir> | cred | api\n");
+        std::printf("usage: core_tests json | logic | version | site <repo-copy> <image-dir> | git <sandbox-dir> | cred | api"
+                    " | live <base-url> <served-dir>\n");
         return 2;
     }
     std::printf(g_failures ? "\n%d FAILURE(S)\n" : "\nALL PASSED\n", g_failures);

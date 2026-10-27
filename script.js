@@ -1,11 +1,31 @@
 (() => {
   const discordHandle = 'ZelRaccy';
 
-  // Site data (data/site-data.js, edited by the manager app). Anything missing or malformed is treated as empty.
-  const siteData = window.SITE_DATA && typeof window.SITE_DATA === 'object' ? window.SITE_DATA : {};
-  const galleryItems = (Array.isArray(siteData.gallery) ? siteData.gallery : [])
-    .filter(item => item && typeof item.file === 'string' && item.file.trim())
-    .map(item => ({ name: typeof item.name === 'string' ? item.name.trim() : '', file: item.file.trim() }));
+  // Site data (data/site-data.js, written by the manager app) is requested with a new ?t= on every visit. A new URL
+  // can't be answered from the browser's or GitHub's cache, so the page always shows the latest published data. If
+  // that fails, the plain URL is tried once; after that the page carries on with no data. Anything missing or
+  // malformed is treated as empty. The status pill, slideshow and gallery are filled in once the data has arrived.
+  function loadSiteData(done) {
+    const attempt = (src, next) => {
+      const script = document.createElement('script');
+      script.src = src;
+      script.onload = () => done(window.SITE_DATA);
+      script.onerror = () => {
+        script.remove();
+        next();
+      };
+      document.head.appendChild(script);
+    };
+    attempt(`data/site-data.js?t=${Date.now()}`, () => attempt('data/site-data.js', () => done(null)));
+  }
+
+  loadSiteData(data => {
+    const siteData = data && typeof data === 'object' ? data : {};
+    const galleryItems = galleryEntries(siteData);
+    renderStatus(siteData.commissionsOpen);
+    renderSlideshow(galleryItems);
+    renderGallery(galleryItems);
+  });
 
   const year = document.getElementById('year');
   if (year) year.textContent = new Date().getFullYear();
@@ -29,10 +49,10 @@
     });
   }
 
-  // Commission status pill
-  const status = document.getElementById('commission-status');
-  if (status && typeof siteData.commissionsOpen === 'boolean') {
-    const open = siteData.commissionsOpen;
+  // Commission status pill (stays hidden until the site data has arrived)
+  function renderStatus(open) {
+    const status = document.getElementById('commission-status');
+    if (!status || typeof open !== 'boolean') return;
     status.classList.add(open ? 'is-open' : 'is-closed');
     status.querySelector('.status-text').textContent = open ? 'Commissions: Open' : 'Commissions: Closed';
     status.hidden = false;
@@ -49,21 +69,40 @@
     });
   }
 
-  // If a gallery image fails from its relative path, retry once straight from the GitHub repository.
+  // Gallery entries from the site data. Images in the site folder get ?v=<version> ("version" in site-data.js, which
+  // the manager app changes on every save), so a replaced image is downloaded again instead of coming from a cache.
+  // If an image fails from its relative path, it is retried once straight from the GitHub repository (same version).
   const repoFiles = 'https://raw.githubusercontent.com/Xavokai/CommissionSIte/main/';
-  function useRepoFallback(img, file, link) {
+  function galleryEntries(siteData) {
+    const version = typeof siteData.version === 'string' ? siteData.version.trim() : '';
+    const withVersion = url => (version ? `${url}${url.includes('?') ? '&' : '?'}v=${encodeURIComponent(version)}` : url);
+    return (Array.isArray(siteData.gallery) ? siteData.gallery : [])
+      .filter(item => item && typeof item.file === 'string' && item.file.trim())
+      .map(item => {
+        const file = item.file.trim();
+        const external = /^([a-z][a-z0-9+.-]*:|\/\/)/i.test(file);
+        return {
+          name: typeof item.name === 'string' ? item.name.trim() : '',
+          src: external ? file : withVersion(file),
+          fallback: external ? '' : withVersion(repoFiles + file.replace(/^\.?\/+/, '')),
+        };
+      });
+  }
+
+  function useRepoFallback(img, item, link) {
     img.addEventListener('error', () => {
-      if (img.dataset.fallbackApplied || /^([a-z][a-z0-9+.-]*:|\/\/)/i.test(file)) return;
+      if (img.dataset.fallbackApplied || !item.fallback) return;
       img.dataset.fallbackApplied = 'true';
-      img.src = repoFiles + file.replace(/^\.?\/+/, '');
+      img.src = item.fallback;
       if (link) link.href = img.src;
     });
   }
 
   // Hero slideshow
-  const showcase = document.getElementById('showcase');
-  const slideshow = document.getElementById('slideshow');
-  if (showcase && slideshow) {
+  function renderSlideshow(galleryItems) {
+    const showcase = document.getElementById('showcase');
+    const slideshow = document.getElementById('slideshow');
+    if (!showcase || !slideshow) return;
     if (!galleryItems.length) {
       showcase.hidden = true;
       showcase.closest('.hero').classList.add('hero-solo');
@@ -82,8 +121,8 @@
       galleryItems.forEach((item, index) => {
         const img = document.createElement('img');
         img.className = 'slide';
-        useRepoFallback(img, item.file);
-        img.src = item.file;
+        useRepoFallback(img, item);
+        img.src = item.src;
         img.alt = item.name;
         img.width = 1920;
         img.height = 1080;
@@ -170,7 +209,8 @@
 
   // Gallery, rendered from site data.
   const galleryGrid = document.getElementById('gallery-grid');
-  if (galleryGrid) {
+  function renderGallery(galleryItems) {
+    if (!galleryGrid) return;
     const spans = gallerySpans(galleryItems.length);
     galleryItems.forEach((item, index) => {
       const figure = document.createElement('figure');
@@ -180,13 +220,13 @@
 
       const link = document.createElement('a');
       link.className = 'gallery-link';
-      link.href = item.file;
+      link.href = item.src;
       link.target = '_blank';
       link.rel = 'noopener';
 
       const img = document.createElement('img');
-      useRepoFallback(img, item.file, link);
-      img.src = item.file;
+      useRepoFallback(img, item, link);
+      img.src = item.src;
       img.alt = item.name;
       img.width = 1920;
       img.height = 1080;
@@ -346,5 +386,13 @@
       audio.addEventListener('pause', sync);
       audio.addEventListener('volumechange', sync);
     }
+  }
+
+  // sw.js makes returning visitors get the page, styles, scripts and site data straight from GitHub instead of from a
+  // cache (see README.md). Service workers only run on http(s), so opening index.html from disk skips this.
+  if ('serviceWorker' in navigator && /^https?:$/.test(window.location.protocol)) {
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    });
   }
 })();
