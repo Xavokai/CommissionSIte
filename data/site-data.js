@@ -1,5 +1,5 @@
 window.SITE_DATA = {
-  "commissionsOpen": true,
+  "commissionsOpen": false,
   "gallery": [
     { "name": "Ember", "file": "assets/gallery/ember.webp" },
     { "name": "Jappy", "file": "assets/gallery/jappy.webp" },
