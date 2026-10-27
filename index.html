@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#121017">
+  <meta name="description" content="5">
+  <meta property="og:title" content="ZelRaccy — Commissions">
+  <meta property="og:description" content="Custom avatars and renders by ZelRaccy. Prices, examples, and commission terms.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://xavokai.github.io/CommissionSIte/">
+  <title>ZelRaccy — Commissions</title>
+  <link rel="icon" type="image/svg+xml" href="assets/paw.svg">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="data/site-data.js"></script>
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="nav-wrap page-width">
+      <a class="brand" href="#top">ZelRaccy</a>
+      <button class="menu-toggle" type="button" aria-label="Open navigation" aria-expanded="false" aria-controls="nav-links"><span></span><span></span><span></span></button>
+      <nav class="nav-links" id="nav-links" aria-label="Main navigation">
+        <a href="#gallery">Work</a>
+        <a href="#commissions">Prices</a>
+        <a href="#tos">Terms</a>
+        <a href="#dos-donts">Guidelines</a>
+        <a class="nav-contact" href="#contact">Contact</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero page-width" id="top">
+      <div class="hero-copy">
+        <p class="status-pill" id="commission-status" hidden><span class="status-dot" aria-hidden="true"></span><span class="status-text"></span></p>
+        <h1>Hi, I'm ZelRaccy.</h1>
+        <p class="hero-lede">I create custom 3D avatars and renders, with a focus on furry characters.</p>
+        <p class="hero-sub">Have a character in mind? Share a few references and tell me what you're looking for.</p>
+        <div class="button-row">
+          <a class="button button-primary" href="#commissions">View prices</a>
+          <a class="button button-secondary" href="#contact">Get in touch</a>
+        </div>
+      </div>
+      <figure class="hero-figure" id="showcase">
+        <div class="slideshow" id="slideshow" role="region" aria-roledescription="carousel" aria-label="Avatar/Render Showcase">
+          <div class="slideshow-frame"></div>
+          <div class="slideshow-controls" hidden>
+            <button class="slideshow-arrow" type="button" data-step="-1" aria-label="Previous image"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 6 8.5 12l6 6"/></svg></button>
+            <div class="slideshow-dots"></div>
+            <button class="slideshow-arrow" type="button" data-step="1" aria-label="Next image"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 6 6 6-6 6"/></svg></button>
+          </div>
+        </div>
+        <figcaption>Avatar/Render Showcase<span class="slideshow-name"></span></figcaption>
+      </figure>
+    </section>
+
+    <section class="section page-width" id="gallery" aria-labelledby="gallery-title">
+      <header class="section-head">
+        <h2 id="gallery-title">Recent work</h2>
+        <p>A selection of avatars and renders I've made. Select any image to view it full size.</p>
+      </header>
+
+      <div class="gallery" id="gallery-grid"></div>
+
+      <p class="section-foot">note: these are slightly older avatars, my avatar work has gotten better because i bought a drawing tablet.</p>
+    </section>
+
+    <section class="section page-width" id="commissions" aria-labelledby="prices-title">
+      <header class="section-head">
+        <h2 id="prices-title">Prices</h2>
+        <p>All prices are in USD.</p>
+      </header>
+
+      <div class="price-list">
+        <article class="price-row">
+          <div class="price-body">
+            <h3>Custom avatar</h3>
+            <p>Avatar setup and edits for your character, priced within the range according to how much work it needs.</p>
+            <ul class="price-details">
+              <li>Priced by complexity</li>
+              <li>Quest / Mobile support available</li>
+            </ul>
+          </div>
+          <div class="price-tag">
+            <span class="price-amount">$25–35</span>
+            <span class="price-extra">+$10 for Quest / Mobile support</span>
+          </div>
+        </article>
+
+        <article class="price-row">
+          <div class="price-body">
+            <h3>4K still render</h3>
+            <p>high-resolution, ideal for a profile picture, wallpaper, or banner, or simply to showcase your character. highly customizable, can include assets from SOME video games.</p>
+            <ul class="price-details">
+              <li>Up to 2–3 characters</li>
+            </ul>
+          </div>
+          <div class="price-tag">
+            <span class="price-amount">$10</span>
+            <span class="price-extra">One 4K image</span>
+          </div>
+        </article>
+
+        <article class="price-row">
+          <div class="price-body">
+            <h3>4K animated render</h3>
+            <p>A short 4096x4096 animation with multiple camera angles</p>
+            <ul class="price-details">
+              <li>24–30 frames</li>
+              <li>Up to 3 angles</li>
+              <li>Max 2 characters</li>
+            </ul>
+          </div>
+          <div class="price-tag">
+            <span class="price-amount">$25</span>
+            <span class="price-extra">Short animation</span>
+          </div>
+        </article>
+      </div>
+
+      <div class="process" id="process">
+        <h3>How it works</h3>
+        <ol class="process-steps">
+          <li><strong>Get in touch.</strong> Send me your idea, references, and any models or assets you'd like me to use.</li>
+          <li><strong>Agree on the details.</strong> We confirm the price, deliverables, revisions, and an estimated timeline.</li>
+          <li><strong>Receive your files.</strong> I create the piece and deliver the finished files once everything is ready.</li>
+        </ol>
+        <p class="process-note">The price covers everything we agree on up front. If your request turns out to need more work, I'll discuss it with you before charging anything extra.</p>
+      </div>
+    </section>
+
+    <section class="section page-width" id="tos" aria-labelledby="tos-title">
+      <div class="terms-layout">
+        <header class="section-head terms-head">
+          <h2 id="tos-title">Terms</h2>
+          <p>By sending payment, you confirm that you've read and agree to these terms. If anything is unclear, please ask before paying.</p>
+          <p class="terms-updated">Last updated: October 2026</p>
+        </header>
+
+        <div class="terms-list">
+          <article class="term">
+            <h3>Payment and refunds</h3>
+            <p>All prices are in USD, and I'll confirm the total before I start. <strong>All payments are final</strong> and refunds aren't normally offered. In a genuine emergency, or if I'm unable to complete the agreed work, <strong>YOU or I</strong> can get in touch and we can discuss it.</p>
+          </article>
+          <article class="term">
+            <h3>Models and other assets</h3>
+            <p>If I don't already have the model or asset you'd like used, you'll need to provide it. I don't purchase models, clothing, textures, or other paid assets for commissions.</p>
+          </article>
+          <article class="term">
+            <h3>Timing and delivery</h3>
+            <p>Turnaround depends on the request and my current workload. I'll give you an estimate when we discuss the commission and let you know if anything causes a delay. You'll receive the final files and formats we agreed on; this doesn't automatically include every source file used to create them.</p>
+          </article>
+          <article class="term">
+            <h3>Sharing and credit</h3>
+            <p>Commissions you make are YOURS to do as you PLEASE, however PLEASE credit me where needed, such as social platforms. this does mean you may re-sell your avatar or send it to avatar makers for other changes.</p>
+          </article>
+          <article class="term">
+            <h3>Communication and cancellations</h3>
+            <p>Please be respectful and as clear as possible about what you'd like, </p>
+          </article>
+          <article class="term">
+            <h3>Adult commissions</h3>
+            <p>Available only to clients aged 18 or over, and only for characters clearly depicted as adults. I don't create sexual content involving minors or age-ambiguous characters, non-consensual sexual content, or illegal or exploitative material. I may also decline anything outside my comfort zone or against the rules of the platform it's intended for.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section page-width" id="dos-donts" aria-labelledby="limits-title">
+      <header class="section-head">
+        <h2 id="limits-title">Content guidelines</h2>
+        <p>What I decline for avatars and renders. If you're unsure where your idea falls, send me a short description before commissioning.</p>
+      </header>
+
+      <div class="limits">
+        <h3 id="limits-dont-title">Not accepted</h3>
+        <ul class="limits-list" aria-labelledby="limits-dont-title">
+          <li><strong>ABDL, diaper, or babyfur content</strong><span>Outside what I'm comfortable creating.</span></li>
+          <li><strong>Scat, watersports, or other extreme fetish content</strong><span>Not accepted in any form.</span></li>
+          <li><strong>Sexual content involving minors</strong><span>Including underage or age-ambiguous characters.</span></li>
+          <li><strong>Non-consensual sexual content</strong><span>Including sexual depictions of real people without their consent.</span></li>
+          <li><strong>Graphic gore or torture</strong><span>Including extreme injury detail, torture-focused scenes, or cruelty for shock value.</span></li>
+          <li><strong>Hateful, exploitative, or illegal requests</strong><span>Including anything intended to harass or target real people.</span></li>
+        </ul>
+      </div>
+
+      <p class="section-foot">This list isn't exhaustive, and I reserve the right to decline any request that doesn't feel right to me.</p>
+    </section>
+
+    <section class="section page-width contact" id="contact" aria-labelledby="contact-title">
+      <img class="contact-avatar" id="contact-avatar" src="https://ugc.production.linktr.ee/20c80ed3-dc45-4050-ab12-1190fc098da2_VRChat-2024-09-07-20-58-49.242-3840x2160.png?io=true&amp;size=avatar-v3_0" width="96" height="96" alt="ZelRaccy's profile picture" loading="lazy">
+      <div class="contact-body">
+        <h2 id="contact-title">Ready to commission?</h2>
+        <p>Send me a message with your idea. References are helpful, but it's fine if you're still working out the details.</p>
+        <div class="button-row">
+          <button class="button button-primary" type="button" id="copy-discord"><span id="discord-button-label">Copy Discord: ZelRaccy</span></button>
+          <a class="button button-secondary" href="https://x.com/ZelRaccy" target="_blank" rel="noopener noreferrer">Find me on X</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="page-width footer-inner">
+      <p>© <span id="year">2026</span> ZelRaccy</p>
+      <p>Please review the current prices and <a href="#tos">terms</a> before sending payment.</p>
+    </div>
+  </footer>
+
+  <dialog class="lightbox" id="lightbox" aria-label="Full-size image">
+    <button class="lightbox-close" type="button">Close</button>
+    <img class="lightbox-image" alt="">
+    <p class="lightbox-caption"></p>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <div class="music" id="music" hidden>
+    <button class="music-toggle" id="music-toggle" type="button" aria-label="Background music" aria-pressed="false" title="Background music">
+      <svg class="icon-muted" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path class="icon-stroke" d="m16 9.5 5 5m0-5-5 5"/></svg>
+      <svg class="icon-on" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path class="icon-stroke" d="M15.5 9a4.2 4.2 0 0 1 0 6M18 6.5a7.8 7.8 0 0 1 0 11"/></svg>
+    </button>
+    <input class="music-volume" id="music-volume" type="range" min="0" max="1" step="0.05" value="0.5" aria-label="Music volume">
+  </div>
+  <audio id="bg-music" src="song.mp3" loop muted preload="auto"></audio>
+</body>
+</html>
